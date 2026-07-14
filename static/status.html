@@ -1,0 +1,372 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AMD · source status</title>
+  <script src="config.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    #summary { line-height: 1.7; }
+    .legend { font-size: .85rem; color: #555; margin: .5rem 0 1rem; }
+    .legend .led { vertical-align: middle; margin: 0 .3rem 0 .9rem; }
+
+    #grid { display: grid; grid-template-columns: repeat(auto-fill, 14px); gap: 4px; }
+    .led {
+      display: inline-block; width: 14px; height: 14px;
+      background: #bbb; transition: background-color .5s ease;
+    }
+    .led.ok     { background: #2e7d32; }
+    .led.warn   { background: #ed9c28; }
+    .led.idle   { background: #bbb; }
+    .led.auth   { background: #1976d2; }
+    .led.nort   { background: #6d4c9f; }
+    .led.novp   { background: #795548; }
+    .led.failed { background: #d32f2f; }
+    /* downloading/importing static GTFS: pulse to signal work in progress */
+    .led.loading { background: #00acc1; animation: pulse 1s ease-in-out infinite; }
+    @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+    /* on the leaderboard: a static ring, no animation */
+    .led.hot    { outline: 2px solid #111; outline-offset: 1px; }
+
+    #tip {
+      position: fixed; display: none; z-index: 10; pointer-events: none;
+      max-width: 420px; white-space: pre-line; overflow-wrap: anywhere;
+      background: #fff; border: 1px solid #999; border-radius: 4px;
+      padding: .4rem .6rem; font-size: .8rem; box-shadow: 0 2px 8px rgba(0,0,0,.2);
+    }
+
+    h2 { font-size: 1rem; margin: 1.5rem 0 .25rem; }
+    #tbl { border-collapse: collapse; font-size: .85rem; }
+    #tbl th, #tbl td { padding: 2px 10px; border-bottom: 1px solid #eee; text-align: left; white-space: nowrap; }
+    #tbl th {
+      cursor: pointer; user-select: none; border-bottom: 2px solid #ccc;
+      position: sticky; top: 0; background: #fff;
+    }
+    #tbl th:hover { background: #f2f2f2; }
+    #tbl td.num, #tbl th.num { text-align: right; font-variant-numeric: tabular-nums; }
+    #tbl tbody tr:hover { background: #fafafa; }
+    /* just a touch of colour: tint only the status cell */
+    #tbl td.st { font-weight: 600; }
+    #tbl td.st.ok     { background: #e6f4ea; }
+    #tbl td.st.warn   { background: #fdf1dd; }
+    #tbl td.st.auth   { background: #e7f0fb; }
+    #tbl td.st.nort   { background: #ece6f5; }
+    #tbl td.st.novp   { background: #efebe9; }
+    #tbl td.st.failed { background: #fce8e6; }
+    #tbl td.st.loading { background: #d9f2f6; }
+    #tbl td.st.idle   { background: #f2f2f2; }
+  </style>
+</head>
+<body>
+  <h1>America's Most Delayed — source status</h1>
+  <p><a href="index.html">&larr; leaderboard</a></p>
+
+  <div id="summary">connecting&hellip;</div>
+  <div class="legend">
+    <span><span class="led ok"></span>active</span>
+    <span><span class="led warn"></span>error</span>
+    <span><span class="led auth"></span>needs auth</span>
+    <span><span class="led nort"></span>no realtime</span>
+    <span><span class="led novp"></span>no vehicle pos</span>
+    <span><span class="led failed"></span>failed</span>
+    <span><span class="led loading"></span>loading GTFS</span>
+    <span><span class="led ok hot"></span>on leaderboard</span>
+    <span>· hover a dot for details</span>
+  </div>
+  <div id="grid"></div>
+  <div id="tip"></div>
+
+  <h2>All sources <span style="font-weight:400;color:#888;font-size:.85rem">(click a column to sort)</span></h2>
+  <table id="tbl">
+    <thead><tr id="head"></tr></thead>
+    <tbody id="body"></tbody>
+  </table>
+
+  <script>
+    const summaryEl = document.getElementById("summary");
+    const grid = document.getElementById("grid");
+    const tip = document.getElementById("tip");
+    const dots = new Map(); // slug -> { el, lastPoll }
+
+    // --- the delta stream ---------------------------------------------------
+    // This page used to poll the whole report every 2 seconds. The report is ~176 KB,
+    // which is ~7.4 GB a day for one open tab — on a VPS that bills egress, it was
+    // the entire hosting bill.
+    //
+    // So we fetch the report *once* (over HTTP, where it arrives gzipped), and after
+    // that the server sends only what changed: the handful of sources whose poll
+    // landed in the last two seconds, and within each, only the fields that moved.
+    // A tick is a few hundred bytes. See `wire.rs` for the protocol; the rules are:
+    //   seq <= ours          -> we already have it
+    //   base > ours          -> we missed a tick; refetch the full report
+    //   otherwise            -> merge it in
+    let sources = new Map();   // slug -> the source as we last knew it
+    let summary = {};
+    let generatedAt = 0;
+    let seq = -1;
+    let fetching = false;
+    let queued = [];           // deltas that arrived while the full was in flight
+
+    function apply(message) {
+      // Hold deltas until the full they build on has landed, rather than throwing
+      // them away and having to refetch.
+      if (fetching && message.base !== undefined) { queued.push(message); return; }
+      if (message.seq <= seq) return;
+      if (message.base !== undefined && message.base > seq) { loadFull(); return; }
+      if (message.base === undefined) { sources = new Map(); }
+
+      for (const row of message.sources) {
+        sources.set(row.slug, { ...sources.get(row.slug), ...row });
+      }
+      for (const slug of message.removed || []) sources.delete(slug);
+
+      seq = message.seq;
+      summary = message.summary;
+      generatedAt = message.generated_at;
+      render();
+    }
+
+    async function loadFull() {
+      if (fetching) return;
+      fetching = true;
+      try {
+        const report = await fetch(`${AMD_API}/api/status`).then((r) => r.json());
+        fetching = false;
+        apply(report);
+        // Replay anything that arrived while we were fetching, oldest first.
+        const held = queued.sort((a, b) => a.seq - b.seq);
+        queued = [];
+        for (const message of held) apply(message);
+      } catch (_) {
+        fetching = false;
+        summaryEl.textContent = "disconnected — retrying…";
+      }
+    }
+
+    function connect() {
+      const socket = new WebSocket(`${AMD_WS}/api/status/live`);
+      socket.onopen = () => loadFull();
+      socket.onmessage = (ev) => apply(JSON.parse(ev.data));
+      socket.onclose = () => {
+        seq = -1;  // whatever we resync to next will be a full
+        setTimeout(connect, 2000);
+      };
+    }
+    connect();
+
+    // --- rendering ----------------------------------------------------------
+    // How long ago this source was last polled. The server sends an absolute
+    // timestamp, not an age: an age would change every tick for every source, so
+    // nothing would ever be "unchanged" and there'd be no delta left to send.
+    function age(s) {
+      return s.last_poll == null ? null : Math.max(generatedAt - s.last_poll, 0);
+    }
+
+    // LED color class for a source's current state — kept in sync with the
+    // status text below so a dot's colour and its tooltip never disagree.
+    function stateClass(s) {
+      // "loading" takes precedence: it's the active work happening right now,
+      // regardless of the source's underlying active/no-realtime state.
+      if (s.loading) return "loading";
+      if (s.state === "failed") return "failed";
+      if (s.state === "requires_auth") return "auth";
+      if (s.state === "no_realtime") return "nort";
+      if (s.state === "no_vehicle_positions") return "novp";
+      if (s.last_success === true) return "ok";
+      if (s.last_success === false) return "warn";
+      return "idle";
+    }
+
+    // Short status word for the table, matching the LED colour.
+    function shortStatus(s) {
+      return { ok: "active", warn: "error", auth: "needs auth", nort: "no realtime", novp: "no vehicle pos", failed: "failed", loading: "loading", idle: "idle" }[stateClass(s)];
+    }
+
+    // Human status line. Every error/failure carries its reason.
+    function statusText(s) {
+      if (s.loading) return "downloading / importing static GTFS…";
+      if (s.state === "failed")
+        return "failed — HTTP " + s.failed_status + (s.last_error ? " (" + s.last_error + ")" : "");
+      if (s.state === "requires_auth") return "requires authentication (not polled)";
+      if (s.state === "no_realtime") return "no GTFS-realtime feed in the catalog (not polled)";
+      if (s.state === "no_vehicle_positions") return "no vehicle-positions feed — can't verify routes (not polled)";
+      if (s.last_success === false) return "error — " + (s.last_error || "unknown");
+      if (s.last_success === true) return "active";
+      return "idle (not polled yet)";
+    }
+
+    function tipText(s) {
+      const lines = [
+        s.display_name,
+        "status: " + statusText(s),
+        "vehicles now: " + s.vehicles_now,
+        "late right now: " + s.late_trips,
+        "delays we can't vouch for: " + s.vetted_out,
+        "scheduled trips: " + (s.total_trips != null ? s.total_trips.toLocaleString() : "unknown"),
+        "on leaderboard: " + (s.hot ? "yes" : "no"),
+        "poll rate: " + (s.poll_interval_seconds != null ? "every " + s.poll_interval_seconds + "s" : "not polled"),
+      ];
+      if (age(s) != null) lines.push("last poll: " + age(s) + "s ago");
+      if (s.peak_vehicles) lines.push("peak vehicles: " + s.peak_vehicles);
+      if (s.country) lines.push("country: " + s.country);
+      return lines.join("\n");
+    }
+
+    // A one-shot brightness blink when a source has just been polled.
+    function flash(el) {
+      el.animate([{ filter: "brightness(1.9)" }, { filter: "brightness(1)" }],
+                 { duration: 800, easing: "ease-out" });
+    }
+
+    function render() {
+      // The very first tick can beat the first HTTP fetch, leaving us with a report
+      // that has no summary yet.
+      if (summary.total_sources == null) return;
+
+      summaryEl.innerHTML =
+        `<b>${summary.total_sources}</b> sources · ` +
+        `<b>${summary.active}</b> active · ` +
+        `<b>${summary.hot}</b> on leaderboard · ` +
+        `<b>${summary.requires_auth}</b> need auth · ` +
+        `<b>${summary.no_realtime}</b> no realtime · ` +
+        `<b>${summary.no_vehicle_positions}</b> no vehicle pos · ` +
+        `<b>${summary.failed}</b> failed · ` +
+        `<b>${summary.loading}</b> loading GTFS · ` +
+        `<b>${summary.vehicles_now.toLocaleString()}</b> vehicles tracked now`;
+
+      for (const s of sources.values()) {
+        let entry = dots.get(s.slug);
+        if (!entry) {
+          const el = document.createElement("div");
+          el.className = "led";
+          grid.append(el);
+          entry = { el, lastPoll: null };
+          dots.set(s.slug, entry);
+        }
+        const { el } = entry;
+        el._data = s;
+        el.className = "led " + stateClass(s) + (s.hot ? " hot" : "");
+
+        // Blink only on a genuinely new poll, never on the first render —
+        // lastPoll is null until we've seen the source once.
+        if (s.last_poll != null && entry.lastPoll != null && s.last_poll > entry.lastPoll) flash(el);
+        entry.lastPoll = s.last_poll ?? entry.lastPoll;
+
+        // Keep the tooltip live if it's currently showing this dot.
+        if (tip.style.display === "block" && tip._slug === s.slug) tip.textContent = tipText(s);
+      }
+
+      // A source can drop out of the report (the static-only list is trimmed to the
+      // biggest agencies, and which those are shifts as the census fills in).
+      for (const [slug, entry] of dots) {
+        if (!sources.has(slug)) { entry.el.remove(); dots.delete(slug); }
+      }
+
+      buildTable();
+    }
+
+    // --- sortable table ----------------------------------------------------
+    const head = document.getElementById("head");
+    const body = document.getElementById("body");
+    const COLS = [
+      { key: "display_name",          label: "Agency" },
+      { key: "status",                label: "Status" },
+      { key: "vehicles_now",          label: "Vehicles",   num: true },
+      { key: "late_trips",            label: "Late now",   num: true },
+      { key: "vetted_out",            label: "Unvouched",  num: true },
+      { key: "peak_vehicles",         label: "Peak",       num: true },
+      { key: "total_trips",           label: "Sched trips", num: true },
+      { key: "poll_interval_seconds", label: "Poll (s)",   num: true },
+      { key: "age",                   label: "Last (s)",   num: true },
+      { key: "hot",                   label: "Board",      num: true },
+    ];
+
+    // Value for a column: mostly the field itself, but "status", "age" and "hot" are
+    // derived rather than sent.
+    function valueOf(s, col) {
+      if (col.key === "status") return shortStatus(s);
+      if (col.key === "age") return age(s);
+      if (col.key === "hot") return s.hot ? 1 : 0;
+      return s[col.key];
+    }
+
+    let sort = { key: "vehicles_now", dir: -1 };  // -1 desc, 1 asc
+
+    function buildTable() {
+      const col = COLS.find((c) => c.key === sort.key) || COLS[0];
+      const rows = [...sources.values()].sort((a, b) => {
+        const x = valueOf(a, col), y = valueOf(b, col);
+        if (col.num) return sort.dir * ((x ?? -Infinity) - (y ?? -Infinity));
+        return sort.dir * String(x).localeCompare(String(y), undefined, { sensitivity: "base" });
+      });
+      body.replaceChildren(...rows.map(rowFor));
+      // Keep the LED grid in the same order as the table: re-appending the existing
+      // dot elements in sorted order moves them into place.
+      grid.append(...rows.map((s) => dots.get(s.slug)?.el).filter(Boolean));
+    }
+
+    // One <tr> for a source.
+    function rowFor(s) {
+      const tr = document.createElement("tr");
+      for (const c of COLS) {
+        const td = document.createElement("td");
+        if (c.key === "status") {
+          td.className = "st " + stateClass(s);
+          td.textContent = shortStatus(s);
+          td.title = statusText(s);
+        } else if (c.key === "hot") {
+          td.className = "num";
+          td.textContent = s.hot ? "★" : "";
+        } else {
+          if (c.num) td.className = "num";
+          const v = valueOf(s, c);
+          td.textContent = v == null ? "—" : (c.num ? v.toLocaleString() : v);
+        }
+        tr.append(td);
+      }
+      return tr;
+    }
+
+    // Header row: click to sort, arrow shows current key/direction.
+    COLS.forEach((c) => {
+      const th = document.createElement("th");
+      if (c.num) th.className = "num";
+      th.dataset.key = c.key;
+      th.addEventListener("click", () => {
+        if (sort.key === c.key) sort.dir *= -1;
+        else sort = { key: c.key, dir: c.num ? -1 : 1 };
+        renderHead();
+        buildTable();
+      });
+      head.append(th);
+    });
+
+    function renderHead() {
+      for (const th of head.children) {
+        const arrow = th.dataset.key === sort.key ? (sort.dir < 0 ? " ▼" : " ▲") : "";
+        th.textContent = COLS.find((c) => c.key === th.dataset.key).label + arrow;
+      }
+    }
+    renderHead();
+
+    // One custom tooltip, positioned by the cursor (delegated to the grid).
+    grid.addEventListener("mouseover", (e) => {
+      const dot = e.target.closest(".led");
+      if (!dot || !dot._data) return;
+      tip._slug = dot._data.slug;
+      tip.textContent = tipText(dot._data);
+      tip.style.display = "block";
+    });
+    grid.addEventListener("mousemove", (e) => {
+      if (tip.style.display !== "block") return;
+      const x = Math.min(e.clientX + 14, window.innerWidth - tip.offsetWidth - 8);
+      tip.style.left = x + "px";
+      tip.style.top = (e.clientY + 14) + "px";
+    });
+    grid.addEventListener("mouseout", (e) => {
+      if (e.target.closest(".led")) tip.style.display = "none";
+    });
+  </script>
+</body>
+</html>

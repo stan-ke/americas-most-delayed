@@ -1,0 +1,13 @@
+name = "America's Most Delayed"
+slug = "americas-most-delayed"
+
+[components]
+[components.server]
+type = "dynamic"
+from = "container"
+
+[components.server.hints]
+avoid_restarts = true
+
+[components.static]
+type = "static"

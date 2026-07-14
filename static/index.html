@@ -1,0 +1,341 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>America's Most Delayed</title>
+  <!-- Leaflet (CDN) for the live map of the most-delayed vehicle. -->
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="config.js"></script>
+  <style>
+    body { font-family: system-ui, sans-serif; margin: 1.5rem; }
+    table { border-collapse: collapse; width: 100%; }
+    th, td { border: 1px solid #ccc; padding: 4px 8px; text-align: left; }
+    th { background: #f2f2f2; }
+    /* the #1 row: make the worst offender stand out */
+    #top td { font-weight: 600; background: #fff6f4; }
+    #map { height: 380px; margin: .5rem 0; border: 1px solid #ccc; background: #eee; }
+    #mapcap { font-size: .9rem; color: #555; margin: .25rem 0 1rem; }
+    /* bus marker: emoji instead of the default pin, no white box */
+    .bus-icon { font-size: 24px; line-height: 28px; text-align: center;
+                background: none; border: none; filter: drop-shadow(0 1px 1px rgba(0,0,0,.4)); }
+    h2 { font-size: 1rem; margin: 1.25rem 0 .35rem; }
+    /* map navigation: step the detail view through the leaderboard */
+    #mapnav { display: flex; align-items: center; gap: .5rem; margin: .75rem 0 .25rem; }
+    #mapnav button { font: inherit; padding: .2rem .7rem; cursor: pointer; }
+    #mapnav button:disabled { opacity: .4; cursor: default; }
+    #mapsel { font-weight: 600; }
+    /* debug column: hidden unless the server has AMD_DEBUG on (body.debug-on) */
+    .dbg { display: none; text-align: center; }
+    body.debug-on .dbg { display: table-cell; }
+    .dbg-btn { cursor: pointer; border: none; background: none; font-size: 1.1rem; padding: 0; }
+    #dbgstatus { font-size: .85rem; color: #555; min-height: 1.2em; margin: .25rem 0 1rem; }
+  </style>
+</head>
+<body>
+  <h1>America's Most Delayed</h1>
+  <p><a href="status.html">source status &rarr;</a></p>
+  <p id="meta">connecting&hellip;</p>
+
+  <h2>Most delayed</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Agency</th><th>Route</th><th>Headsign</th>
+        <th>Next stop</th><th>Vehicle</th><th>Late</th><th>Watched</th><th>Source</th><th class="dbg">Debug</th>
+      </tr>
+    </thead>
+    <tbody id="top"></tbody>
+  </table>
+
+  <div id="mapnav">
+    <button id="prev" title="Show a more-delayed trip (toward #1)">&#9650; up</button>
+    <button id="next" title="Show a less-delayed trip (toward #25)">&#9660; down</button>
+    <span id="mapsel">&mdash;</span>
+  </div>
+  <div id="map"></div>
+  <p id="mapcap">waiting for the most-delayed vehicle&hellip;</p>
+  <p id="dbgstatus"></p>
+
+  <h2>The rest of the worst</h2>
+  <table>
+    <thead>
+      <tr>
+        <th>#</th><th>Agency</th><th>Route</th><th>Headsign</th>
+        <th>Next stop</th><th>Vehicle</th><th>Late</th><th>Watched</th><th>Source</th><th class="dbg">Debug</th>
+      </tr>
+    </thead>
+    <tbody id="rest"></tbody>
+  </table>
+
+  <script type="module">
+    const meta = document.getElementById("meta");
+    const top = document.getElementById("top");
+    const rest = document.getElementById("rest");
+    const mapcap = document.getElementById("mapcap");
+    const dbgstatus = document.getElementById("dbgstatus");
+    const mapsel = document.getElementById("mapsel");
+    const prevBtn = document.getElementById("prev");
+    const nextBtn = document.getElementById("next");
+
+    // The most recent board, which index of it the map/detail view is showing, and
+    // whether the server enabled debug capture.
+    let latest = [];
+    let selectedIndex = 0;
+
+    // Seconds -> "1h 12m 30s".
+    function fmtDelay(s) {
+      const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60), sec = s % 60;
+      if (h) return `${h}h ${m}m ${sec}s`;
+      if (m) return `${m}m ${sec}s`;
+      return `${sec}s`;
+    }
+
+    function cell(text) {
+      const td = document.createElement("td");
+      td.textContent = text ?? "";
+      return td;
+    }
+
+    // How the delay got here: how long we've watched this trip, and how much of its
+    // lateness it picked up while we watched. Every ranked trip was on time (or
+    // nearly) when we first saw it and got worse under observation — that's what
+    // makes the number credible rather than a stale trip id from the feed.
+    function fmtGrowth(e) {
+      return fmtDelay(Math.max(e.delay_seconds - e.birth_delay_seconds, 0));
+    }
+    function fmtBirth(e) {
+      return e.birth_delay_seconds > 0 ? `${fmtDelay(e.birth_delay_seconds)} late` : "on time";
+    }
+
+    function rowFor(e) {
+      const tr = document.createElement("tr");
+      const watched = cell(`${fmtDelay(e.tracked_seconds)} · +${fmtGrowth(e)}`);
+      watched.title =
+        `watched for ${fmtDelay(e.tracked_seconds)}; was ${fmtBirth(e)} when first seen, ` +
+        `and has lost ${fmtGrowth(e)} since`;
+      tr.append(
+        cell(e.rank), cell(e.agency), cell(e.route), cell(e.headsign),
+        cell(e.next_stop), cell(e.vehicle), cell(fmtDelay(e.delay_seconds)), watched, cell(e.source),
+      );
+      // Debug-capture cell — kept in the DOM always, revealed by CSS only when
+      // the server has AMD_DEBUG on (body.debug-on).
+      const dbg = document.createElement("td");
+      dbg.className = "dbg";
+      const btn = document.createElement("button");
+      btn.className = "dbg-btn";
+      btn.textContent = "🐛";
+      btn.title = "Capture a debug archive for this entry";
+      btn.addEventListener("click", () => captureDebug(e));
+      dbg.append(btn);
+      tr.append(dbg);
+      return tr;
+    }
+
+    // Prompt for a note, then ask the server to zip up everything behind this
+    // entry (config, live GTFS-RT, static GTFS, computed delay) for offline
+    // debugging. Only wired up when debug mode is on.
+    async function captureDebug(e) {
+      const msg = prompt(
+        `What's wrong with #${e.rank} ${e.agency} — route ${e.route}, ` +
+        `${fmtDelay(e.delay_seconds)} late?\n\nDescribe the problem (saved into the archive):`,
+        "");
+      if (msg === null) return; // cancelled
+      dbgstatus.textContent = `capturing #${e.rank} ${e.agency}…`;
+      try {
+        const res = await fetch(`${AMD_API}/api/debug/capture`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ slug: e.slug, trip_id: e.trip_id, message: msg }),
+        });
+        const data = await res.json();
+        dbgstatus.textContent = data.ok
+          ? `✓ saved ${data.path}`
+          : `✗ capture failed: ${data.error}`;
+      } catch (err) {
+        dbgstatus.textContent = `✗ capture failed: ${err}`;
+      }
+    }
+
+    // --- Leaflet map for the selected delayed vehicle -----------------------
+    const map = L.map("map").setView([39.5, -98.35], 4); // continental US
+    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 21, attribution: "&copy; OpenStreetMap contributors",
+    }).addTo(map);
+    const busIcon = L.divIcon({
+      html: "🚌", className: "bus-icon",
+      iconSize: [28, 28], iconAnchor: [14, 14], popupAnchor: [0, -14],
+    });
+    let marker = null;
+    let routeLine = null;
+    // The trip whose route we've drawn, so we only refetch the shape when the
+    // selection actually changes — not on every 15s snapshot.
+    let shapeKey = null;
+
+    // The server sends a route as an encoded polyline rather than an array of
+    // coordinate pairs: a rail shape is thousands of points, and delta-encoding
+    // consecutive ones costs ~2 characters apiece instead of ~11 (9x smaller).
+    function decodePolyline(encoded) {
+      const points = [];
+      let i = 0, lat = 0, lon = 0;
+      while (i < encoded.length) {
+        for (const axis of [0, 1]) {
+          let result = 0, shift = 0, byte;
+          do {
+            byte = encoded.charCodeAt(i++) - 63;
+            result |= (byte & 0x1f) << shift;
+            shift += 5;
+          } while (byte >= 0x20);
+          const delta = (result & 1) ? ~(result >> 1) : (result >> 1);
+          if (axis === 0) lat += delta; else lon += delta;
+        }
+        points.push([lat / 1e5, lon / 1e5]);
+      }
+      return points;
+    }
+
+    // Fetch and draw the route path for the selected trip, on demand. The backend
+    // reads just this trip's shape from the static feed and drops it, and the
+    // response is cached by the browser for a day, so stepping back and forth
+    // through the board costs nothing after the first look.
+    async function drawRoute(entry) {
+      const key = `${entry.slug} ${entry.trip_id}`;
+      if (key === shapeKey) return; // same trip — keep the line we already have
+      shapeKey = key;
+      if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+      if (!entry.slug || !entry.trip_id) return;
+      try {
+        const path = encodeURIComponent(entry.slug) + "/" + encodeURIComponent(entry.trip_id);
+        const { polyline } = await (await fetch(`${AMD_API}/api/shape/${path}`)).json();
+        const points = decodePolyline(polyline || "");
+        // Guard against a later snapshot having moved on while we awaited.
+        if (shapeKey !== key || points.length < 2) return;
+        routeLine = L.polyline(points, { color: "#d33", weight: 4, opacity: 0.7 }).addTo(map);
+        map.fitBounds(routeLine.getBounds(), { padding: [30, 30] });
+      } catch (_) { /* leave the map with just the marker */ }
+    }
+
+    // Drop the marker + route line, e.g. when the selected entry has no live
+    // position so a stale overlay from a previous selection isn't left behind.
+    function clearOverlays() {
+      if (routeLine) { map.removeLayer(routeLine); routeLine = null; }
+      if (marker) { map.removeLayer(marker); marker = null; }
+      shapeKey = null;
+    }
+
+    function updateMap(entry) {
+      if (!entry) {
+        mapcap.textContent = "no delays reported right now";
+        clearOverlays();
+        return;
+      }
+      const label =
+        `#${entry.rank} ${entry.agency} · route ${entry.route} · ${fmtDelay(entry.delay_seconds)} late` +
+        ` · was ${fmtBirth(entry)} when we picked it up ${fmtDelay(entry.tracked_seconds)} ago`;
+      if (entry.latitude == null || entry.longitude == null) {
+        mapcap.textContent = `${label} · no live location for this vehicle yet`;
+        clearOverlays();
+        return;
+      }
+      drawRoute(entry);
+      const ll = [entry.latitude, entry.longitude];
+      if (!marker) marker = L.marker(ll, { icon: busIcon }).addTo(map);
+      else marker.setLatLng(ll);
+      marker.bindPopup(
+        `<b>#${entry.rank} ${entry.agency}</b><br>route ${entry.route}` +
+        `${entry.headsign ? " &rarr; " + entry.headsign : ""}<br>` +
+        `${fmtDelay(entry.delay_seconds)} late`);
+      // Only recenter on the vehicle when we haven't fitted the map to a route.
+      if (!routeLine) map.setView(ll, 12);
+      mapcap.textContent =
+        `${label} · vehicle at ${entry.latitude.toFixed(4)}, ${entry.longitude.toFixed(4)}`;
+    }
+
+    // The entry the map/detail view is showing, clamping the selection to the
+    // current board (which may have shrunk since the user last stepped).
+    function selectedEntry() {
+      if (!latest.length) return null;
+      selectedIndex = Math.min(Math.max(selectedIndex, 0), latest.length - 1);
+      return latest[selectedIndex];
+    }
+
+    function updateNav() {
+      const n = latest.length;
+      if (!n) {
+        mapsel.textContent = "—";
+        prevBtn.disabled = nextBtn.disabled = true;
+        return;
+      }
+      mapsel.textContent = `#${selectedIndex + 1} of ${n}`;
+      prevBtn.disabled = selectedIndex <= 0;
+      nextBtn.disabled = selectedIndex >= n - 1;
+    }
+
+    // Redraw the map + nav for the current selection (after a step or a snapshot).
+    function updateSelection() {
+      updateNav();
+      updateMap(selectedEntry());
+    }
+
+    prevBtn.addEventListener("click", () => { selectedIndex -= 1; updateSelection(); });
+    nextBtn.addEventListener("click", () => { selectedIndex += 1; updateSelection(); });
+
+    function render(message, entries) {
+      latest = entries;
+      document.body.classList.toggle("debug-on", !!message.debug_enabled);
+
+      top.replaceChildren(...entries.slice(0, 1).map(rowFor));
+      rest.replaceChildren(...entries.slice(1).map(rowFor));
+      updateSelection();
+
+      const when = new Date(message.generated_at * 1000).toLocaleTimeString();
+      meta.textContent = entries.length
+        ? `${entries.length} trips · updated ${when}`
+        : `no delays reported right now · updated ${when}`;
+    }
+
+    // --- the delta stream ---------------------------------------------------
+    // The server doesn't re-send the board every 15s; it sends what changed, and
+    // within a changed entry only the fields that changed. We hold the last full
+    // board and merge each message into it. See `wire.rs` for the protocol.
+    let entries = new Map();  // trip identity -> the entry as we last knew it
+    let seq = -1;             // the last message we've applied
+
+    // What names an entry across ticks: the same identity the server keys deltas by.
+    const key = (e) => JSON.stringify([e.slug, e.trip_id]);
+
+    function apply(message, socket) {
+      // Already have it — a delta can arrive that we're not behind on.
+      if (message.seq <= seq) return;
+      // A tick went missing, so a merge would silently keep stale fields. Drop the
+      // socket and reconnect into a fresh full.
+      if (message.base !== undefined && message.base > seq) { socket.close(); return; }
+      // No `base` means a full: it replaces everything rather than merging.
+      if (message.base === undefined) entries = new Map();
+
+      const board = message.entries.map((row) => {
+        const merged = { ...entries.get(key(row)), ...row };
+        entries.set(key(row), merged);
+        return merged;
+      });
+      // The message carries the whole board in rank order, so anything not in it
+      // has fallen off and can be forgotten.
+      entries = new Map(board.map((e) => [key(e), e]));
+      seq = message.seq;
+      render(message, board);
+    }
+
+    function connect() {
+      const socket = new WebSocket(`${AMD_WS}/api/subscribe`);
+      socket.onmessage = (ev) => apply(JSON.parse(ev.data), socket);
+      socket.onclose = () => {
+        meta.textContent = "disconnected — reconnecting…";
+        seq = -1;  // whatever comes back will be a full
+        setTimeout(connect, 2000);
+      };
+    }
+    connect();
+  </script>
+</body>
+</html>
