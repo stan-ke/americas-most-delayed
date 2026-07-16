@@ -2,6 +2,7 @@
 
 mod agency;
 mod api;
+mod auth;
 mod catalogs;
 mod delay;
 mod gtfs;
@@ -11,10 +12,12 @@ mod scheduler;
 mod wire;
 
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use anyhow::Result;
 
 use crate::agency::{AgencyConfig, GeoPoint};
+use crate::auth::FeedAuth;
 use crate::catalogs::catalog::GtfsCatalogProvider;
 use crate::catalogs::mobilitydata::MobilityDataProvider;
 use crate::catalogs::transitland::TransitlandProvider;
@@ -55,12 +58,17 @@ impl CatalogSource {
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let configs = collect_agencies().await?;
+    // Feed credentials (git-ignored `keys.env`) — loaded once and shared by the
+    // agency wiring (which feeds it can build) and the scheduler (which injects the
+    // credentials into requests).
+    let auth = Arc::new(FeedAuth::load());
+
+    let configs = collect_agencies(&auth).await?;
     println!("Monitoring {} agencies", configs.len());
 
     // Spawn the polling tasks, then serve the API/frontend for as long as the
     // process lives.
-    let scheduler = scheduler::start(configs)?;
+    let scheduler = scheduler::start(configs, auth)?;
     api::serve(scheduler).await
 }
 
@@ -72,8 +80,12 @@ async fn main() -> Result<()> {
 /// URL, so the same agency listed under two catalogs' differing ids isn't polled
 /// twice — the earlier (more-preferred) source wins. Finally the list is scoped
 /// to North America.
-async fn collect_agencies() -> Result<Vec<AgencyConfig>> {
+async fn collect_agencies(auth: &FeedAuth) -> Result<Vec<AgencyConfig>> {
+    // NJ Transit and the other hand-configured feeds go first, so they win dedup
+    // over the catalogs' `requires_auth` / `no_realtime` versions of the same
+    // agency (see `agency::authed_agencies`).
     let mut configs = vec![agency::nj_transit()];
+    configs.extend(agency::authed_agencies(auth));
     for &source in CATALOG_SOURCES {
         match source.load().await {
             Ok(agencies) => {
