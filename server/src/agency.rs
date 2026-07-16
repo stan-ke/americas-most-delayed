@@ -5,11 +5,8 @@
 //! incrementally (see `catalogs::mobilitydata`) before handing over a complete
 //! config here.
 
-<<<<<<< Updated upstream
 use crate::auth::{self, FeedAuth};
 
-=======
->>>>>>> Stashed changes
 /// Static description of one transit feed we monitor.
 #[derive(Debug, Clone)]
 pub struct AgencyConfig {
@@ -244,7 +241,14 @@ pub fn authed_agencies(auth: &FeedAuth) -> Vec<AgencyConfig> {
     // rotation (a feed with none is skipped). Subway positions are stop-based rather
     // than coordinates, so the map has nothing to plot, but the delays still rank.
     let subway_feeds: Vec<String> = [
-        "gtfs", "gtfs-ace", "gtfs-bdfm", "gtfs-g", "gtfs-jz", "gtfs-nqrw", "gtfs-l", "gtfs-si",
+        "gtfs",
+        "gtfs-ace",
+        "gtfs-bdfm",
+        "gtfs-g",
+        "gtfs-jz",
+        "gtfs-nqrw",
+        "gtfs-l",
+        "gtfs-si",
     ]
     .iter()
     .map(|feed| format!("https://api-endpoint.mta.info/Dataservice/mtagtfsfeeds/nyct%2F{feed}"))
