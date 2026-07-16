@@ -509,11 +509,11 @@ impl Scheduler {
             let _permit = self.limiter.acquire().await.expect("semaphore stays open");
             let mut entities = Vec::new();
             for url in &config.realtime_urls.trip_updates_url {
-<<<<<<< Updated upstream
-                entities.extend(realtime::fetch_feed(&self.client, &self.auth, url).await?.entity);
-=======
-                entities.extend(realtime::fetch_feed(&self.client, url).await?.entity);
->>>>>>> Stashed changes
+                entities.extend(
+                    realtime::fetch_feed(&self.client, &self.auth, url)
+                        .await?
+                        .entity,
+                );
             }
             entities
         };
@@ -967,22 +967,14 @@ impl Scheduler {
         // state. Each fetch is best-effort: a failure is recorded, not fatal.
         let mut tu_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
         for url in &config.realtime_urls.trip_updates_url {
-<<<<<<< Updated upstream
             let bytes = realtime::fetch_bytes(&self.client, &self.auth, url)
-=======
-            let bytes = realtime::fetch_bytes(&self.client, url)
->>>>>>> Stashed changes
                 .await
                 .map_err(|e| format!("{e:#}"));
             tu_raw.push((url.clone(), bytes));
         }
         let mut vp_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
         for url in &config.realtime_urls.vehicle_positions_url {
-<<<<<<< Updated upstream
             let bytes = realtime::fetch_bytes(&self.client, &self.auth, url)
-=======
-            let bytes = realtime::fetch_bytes(&self.client, url)
->>>>>>> Stashed changes
                 .await
                 .map_err(|e| format!("{e:#}"));
             vp_raw.push((url.clone(), bytes));
