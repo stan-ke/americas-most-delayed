@@ -52,28 +52,26 @@ catalog fetch, then `scheduler::start` spawns the polling tasks and returns the
 shared `Arc<Scheduler>`; `api::serve` runs the server on that handle, and the
 process stays alive for as long as it serves.
 
-### Agency configuration and the `partial_config!` macro
+### Agency configuration
 
-`AgencyConfig` (in `agency.rs`) is the unit of "one feed we monitor". It and its
-all-fields-optional twin `PartialAgencyConfig` are **both generated from a single
-field list** by the `partial_config!` macro in `macros.rs`. Add a config field in
-one place there; the macro derives the complete struct, the partial struct, the
-`merge_other` logic (combining partial configs, `self` wins on conflict), and the
-`upgrade_to_complete` logic (`required` fields error if missing). This exists
-because a single agency's data is assembled from multiple catalog rows.
+`AgencyConfig` (in `agency.rs`) is the unit of "one feed we monitor" — a plain
+struct with the slug, display name, static-GTFS URL, `GtfsRtUrls` (the
+trip-updates and vehicle-positions feed URLs), and dedup metadata. A single
+agency's data is assembled from multiple catalog rows, so each catalog provider
+accumulates one up incrementally before handing over a complete config.
 
-`catalogs/mobilitydata.rs` fetches MobilityData's `feeds_v2.csv`, turns every row
-into a `PartialAgencyConfig`, then **merges static-feed and realtime-feed rows
-into one complete config** keyed by `static_reference`. Entries with both a static
-URL and a trip-updates URL become normal pollable configs via
-`upgrade_to_complete`. An entry that has a static feed but **no paired realtime
-feed** isn't dropped: if its catalog status is `active`, it's kept as a
-**static-only config** (built by hand with an empty realtime URL set) so it can
-surface in `/status` as `no_realtime` — this is how a large agency the catalog is
-missing GTFS-realtime for (e.g. TTC, CTA, Muni, GO Transit — the reason NJ Transit
-is hand-configured) becomes visible rather than silently absent. Deprecated/
-inactive/dev static feeds are dropped; only rows with neither a realtime nor a
-static feed are truly skipped.
+`catalogs/mobilitydata.rs` fetches MobilityData's `feeds_v2.csv` and folds its rows
+into one `Build` per real agency, **keyed by the static feed's id**: a static row
+keys on its own id, a realtime row on its `static_reference` (each row's scalar
+fields fill the `Build` first-seen-wins; realtime URLs from every matching row
+accumulate). A `Build` with both a static URL and a trip-updates URL becomes a
+normal pollable config. One that has a static feed but **no paired realtime feed**
+isn't dropped: if its catalog status is `active`, it's kept as a **static-only
+config** (empty realtime URLs) so it can surface in `/status` as `no_realtime` —
+this is how a large agency the catalog is missing GTFS-realtime for (e.g. TTC, CTA,
+Muni, GO Transit — the reason NJ Transit is hand-configured) becomes visible rather
+than silently absent. Deprecated/inactive/dev static feeds are dropped; only groups
+with neither a realtime nor a static feed are truly skipped.
 
 `catalogs/transitland.rs` is a second catalog source: the **Transitland Atlas**
 (<https://github.com/transitland/transitland-atlas>), published as a GitHub repo
@@ -102,8 +100,8 @@ so `country_code` decodes the Onestop ID's geohash (`o-<geohash>-<name>`) with t
 `geohash` crate and reverse-geocodes the point to an ISO country code with the
 `reverse_geocoder` crate (offline, worldwide) — a general lat/lon→country helper,
 not North-America-specific. The decoded point is also kept as the config's
-`location` ([`GeoPoint`], microdegrees so the config stays `Eq`), used for dedup;
-MobilityData fills `location` from each feed's bounding-box center.
+`location` (a [`GeoPoint`] pair of degrees, with a haversine `distance_km`), used
+for dedup; MobilityData fills `location` from each feed's bounding-box center.
 
 `main.rs` draws from an ordered, editable `CATALOG_SOURCES` list of a
 `CatalogSource` enum (currently `[Transitland, MobilityData]`) — reorder to change

@@ -18,6 +18,7 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 # Raw FFI (same sqlite rusqlite bundles) purely for `sqlite3_memory_used` — the only
 # way to tell how much of our heap is SQLite's page/statement caches. See
 # `gtfs::sqlite_memory`.
+# FIXME: Remove libsqlite3-sys
 libsqlite3-sys = { version = "0.38.1", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

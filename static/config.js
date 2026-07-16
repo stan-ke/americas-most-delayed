@@ -7,7 +7,7 @@
 //
 // Must be https — GitHub Pages is served over https, and a browser will refuse to
 // call a plain-http API from an https page (mixed content).
-window.AMD_API = "https://api.americasmostdelayed.example";
+window.AMD_API = "<api_url>";
 
 // Working from a local checkout (or file://)? Talk to `cargo run` instead.
 if (["localhost", "127.0.0.1", ""].includes(location.hostname)) {

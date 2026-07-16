@@ -6,7 +6,6 @@ mod catalogs;
 mod delay;
 mod gtfs;
 mod history;
-mod macros;
 mod realtime;
 mod scheduler;
 mod wire;
@@ -103,7 +102,7 @@ async fn collect_agencies() -> Result<Vec<AgencyConfig>> {
     let mut seen_static = HashSet::new();
     let mut seen_realtime = HashSet::new();
     configs.retain(|config| {
-        let urls = config.realtime_urls.trip_updates_url();
+        let urls = &config.realtime_urls.trip_updates_url;
         if seen_slugs.contains(&config.slug)
             || seen_static.contains(&config.static_url)
             || urls.iter().any(|url| seen_realtime.contains(url))
