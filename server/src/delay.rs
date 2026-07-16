@@ -23,8 +23,6 @@ pub fn vehicle_positions(feed: &FeedMessage) -> VehiclePositions {
             let trip_id = vehicle.trip.as_ref()?.trip_id.clone()?;
             let position = vehicle.position.as_ref()?;
             let (lat, lon) = (position.latitude as f64, position.longitude as f64);
-            // Drop "null island" (0, 0) — a vehicle with no GPS fix, never a real
-            // transit location — so it can't strand the map in the Atlantic.
             (lat != 0.0 || lon != 0.0).then_some((trip_id, (lat, lon)))
         })
         .collect()

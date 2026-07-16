@@ -1,5 +1,7 @@
+use std::collections::HashMap;
+
 use crate::{
-    agency::{AgencyConfig, GeoPoint, GtfsRtUrlSet, PartialAgencyConfig, PartialGtfsRtUrlSet},
+    agency::{AgencyConfig, GeoPoint, GtfsRtUrls},
     catalogs::catalog::GtfsCatalogProvider,
 };
 use anyhow::Context;
@@ -256,167 +258,154 @@ pub struct MobilityDataProvider {
     agencies: Vec<AgencyConfig>,
 }
 
+/// Drop duplicate URLs, keeping first occurrence — two catalog rows can point a
+/// bucket at the same feed, and we don't want to poll it twice.
+fn dedup(mut urls: Vec<String>) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    urls.retain(|url| seen.insert(url.clone()));
+    urls
+}
+
+/// A single agency's config accumulated across catalog rows. A real agency is
+/// split across a static-feed row and one or more realtime-feed rows sharing a
+/// `static_reference`; we fold every matching row into one of these, then turn it
+/// into a complete [`AgencyConfig`]. The first row seen wins each scalar field.
+#[derive(Default)]
+struct Build {
+    display_name: Option<String>,
+    gtfs_rt_requires_auth: Option<bool>,
+    country_code: Option<String>,
+    location: Option<GeoPoint>,
+    static_url: Option<String>,
+    trip_updates_url: Vec<String>,
+    vehicle_positions_url: Vec<String>,
+}
+
+impl Build {
+    fn fold(&mut self, source: &Source) {
+        // The catalog `name` is often blank; fall back to the operator name and
+        // then the feed id so the leaderboard never shows an empty label.
+        let display_name = [source.name.trim(), source.provider.trim()]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or(source.id.as_str());
+        self.display_name
+            .get_or_insert_with(|| display_name.to_string());
+        // 0 is no authentication, 1/2 are basic/digest.
+        self.gtfs_rt_requires_auth = self
+            .gtfs_rt_requires_auth
+            .or_else(|| source.authentication_type.map(|t| matches!(t, 1 | 2)));
+        self.country_code
+            .get_or_insert_with(|| source.country_code.clone());
+        self.location = self.location.or_else(|| bbox_center(source));
+
+        if source.data_type == DataType::Gtfs {
+            if self.static_url.is_none() {
+                self.static_url = source.direct_download.clone();
+            }
+            return;
+        }
+
+        // A realtime row carries one direct-download URL that serves whichever
+        // entity types it lists (an empty list means all of them). Route it into
+        // the bucket(s) we actually consume; many rows across one agency
+        // accumulate here. Service-alerts-only feeds contribute nothing.
+        let Some(url) = source.direct_download.clone() else {
+            return;
+        };
+        let all = source.entity_type.is_empty();
+        let serves = |entity| all || source.entity_type.contains(&entity);
+        if serves(RealtimeEntity::TripUpdates) {
+            self.trip_updates_url.push(url.clone());
+        }
+        if serves(RealtimeEntity::VehiclePositions) {
+            self.vehicle_positions_url.push(url);
+        }
+    }
+}
+
 impl MobilityDataProvider {
     pub async fn new() -> Result<Self, anyhow::Error> {
         let catalog = get_catalog()
             .await
             .context("fetching MobilityData catalog")?;
 
-        // Turn each catalog entry into a PartialAgencyConfig. Alongside, remember
-        // each static feed's catalog status keyed by its id (which is also its
-        // merge key), so a static-only feed can later be dropped unless it's
-        // `active` — deprecated/inactive/dev feeds are defunct, not agencies
-        // we're realistically missing realtime for.
-        let mut gtfs_status: std::collections::HashMap<String, Status> =
-            std::collections::HashMap::new();
-        let mut partial_agencies = Vec::new();
-        for source in catalog {
+        // Group rows into one `Build` per real agency, keyed by the static feed's
+        // id: a static row keys on its own id, a realtime row on its
+        // `static_reference` (falling back to its own id when it names no static
+        // feed). Alongside, remember each static feed's catalog status so a
+        // static-only agency can later be dropped unless it's `active` —
+        // deprecated/inactive/dev feeds are defunct, not agencies we're
+        // realistically missing realtime for.
+        let mut builds: HashMap<String, Build> = HashMap::new();
+        let mut gtfs_status: HashMap<String, Status> = HashMap::new();
+        for source in &catalog {
             if source.data_type == DataType::Gtfs {
                 gtfs_status.insert(source.id.clone(), source.status);
             }
-            // The catalog `name` is often blank; fall back to the operator name
-            // and then the feed id so the leaderboard never shows an empty label.
-            let display_name = [source.name.trim(), source.provider.trim()]
-                .into_iter()
-                .find(|s| !s.is_empty())
-                .unwrap_or(source.id.as_str())
-                .to_string();
-
-            let mut config = PartialAgencyConfig {
-                slug: Some(source.id.clone()),
-                display_name: Some(display_name),
-                // 0 is no authentication, 1/2 are basic/digest
-                gtfs_rt_requires_auth: source.authentication_type.map(|t| matches!(t, 1 | 2)),
-                country_code: Some(source.country_code.clone()),
-                location: bbox_center(&source),
-                ..Default::default()
+            let key = match source.data_type {
+                DataType::Gtfs => source.id.clone(),
+                DataType::GtfsRt => source
+                    .static_reference
+                    .clone()
+                    .unwrap_or_else(|| source.id.clone()),
             };
-
-            if source.data_type == DataType::Gtfs {
-                config.static_url = source.direct_download.clone();
-            } else {
-                let realtime_types = if source.entity_type.is_empty() {
-                    vec![
-                        RealtimeEntity::TripUpdates,
-                        RealtimeEntity::VehiclePositions,
-                        RealtimeEntity::ServiceAlerts,
-                    ]
-                } else {
-                    source.entity_type
-                };
-
-                let url = source.direct_download.clone();
-                let url_for_entity = |entity: RealtimeEntity| {
-                    realtime_types
-                        .contains(&entity)
-                        .then_some(url.clone())
-                        .flatten()
-                };
-
-                config.realtime_urls = Some(PartialGtfsRtUrlSet::Separate {
-                    trip_updates_url: url_for_entity(RealtimeEntity::TripUpdates)
-                        .into_iter()
-                        .collect(),
-                    vehicle_positions_url: url_for_entity(RealtimeEntity::VehiclePositions)
-                        .into_iter()
-                        .collect(),
-                    service_alerts_url: url_for_entity(RealtimeEntity::ServiceAlerts)
-                        .into_iter()
-                        .collect(),
-                });
-                config.static_reference = source.static_reference.clone();
-            }
-
-            partial_agencies.push(config);
+            builds.entry(key).or_default().fold(source);
         }
 
-        // Find duplicates by their static agency ID (slug) and merge them together
-        let mut merged_agencies = std::collections::HashMap::new();
-        for mut partial in partial_agencies {
-            // Unify under the static feed's ID so static and real-time feeds merge seamlessly.
-            let key = partial
-                .static_reference
-                .clone()
-                .or_else(|| partial.slug.clone());
-
-            // Normalize the slug so that when merged, we always keep the static feed's ID.
-            partial.slug = key.clone();
-
-            merged_agencies
-                .entry(key)
-                .and_modify(|existing: &mut PartialAgencyConfig| {
-                    *existing = existing.merge_other(&partial).unwrap_or_else(|err| {
-                        eprintln!(
-                            "[{}] failed to merge duplicate agency configs: {err:#}",
-                            existing
-                                .display_name
-                                .clone()
-                                .unwrap_or_else(|| "unknown".to_string())
-                        );
-                        existing.clone()
-                    });
-                })
-                .or_insert(partial);
-        }
-
-        // Upgrade every merged config to a complete AgencyConfig. Most catalog
-        // entries only supply a static *or* a realtime feed and can't be fully
-        // upgraded — that's expected at this scale, so we don't log each one.
+        // Turn each group into a complete AgencyConfig. Most agencies expose a
+        // static *or* a realtime feed but not both paired; that's expected at
+        // this scale, so we don't log each one.
         //
-        // A merged entry that has a static schedule but no paired realtime feed
+        // A group that has a static schedule but no realtime trip-updates feed
         // isn't dropped: we still surface it (with an empty realtime URL set) so
         // it shows up in `/status` as `no_realtime`, making a large agency the
         // catalog is missing GTFS-realtime for (like NJ Transit) visible rather
-        // than silently absent. Only entries with neither a poll-able realtime
-        // feed nor a static schedule are truly skipped.
-        let mut complete_agencies = Vec::new();
+        // than silently absent. Only groups with neither a trip-updates feed nor
+        // a static schedule are truly skipped.
+        let mut agencies = Vec::new();
         let mut static_only = 0usize;
         let mut dropped_inactive = 0usize;
         let mut skipped = 0usize;
-        for partial in merged_agencies.into_values() {
-            match partial.upgrade_to_complete() {
-                Ok(complete) => complete_agencies.push(complete),
-                Err(_) => match partial.static_url {
-                    Some(static_url) => {
-                        let active = partial
-                            .slug
-                            .as_deref()
-                            .and_then(|id| gtfs_status.get(id))
-                            .is_some_and(|status| *status == Status::Active);
-                        if !active {
-                            dropped_inactive += 1;
-                            continue;
-                        }
-                        static_only += 1;
-                        complete_agencies.push(AgencyConfig {
-                            slug: partial.slug.unwrap_or_default(),
-                            display_name: partial.display_name.unwrap_or_default(),
-                            static_url,
-                            realtime_urls: GtfsRtUrlSet::Separate {
-                                trip_updates_url: Vec::new(),
-                                vehicle_positions_url: Vec::new(),
-                                service_alerts_url: Vec::new(),
-                            },
-                            gtfs_rt_requires_auth: partial.gtfs_rt_requires_auth,
-                            country_code: partial.country_code,
-                            location: partial.location,
-                        });
-                    }
-                    None => skipped += 1,
-                },
+        for (slug, build) in builds {
+            let Some(static_url) = build.static_url else {
+                skipped += 1;
+                continue;
+            };
+            if build.trip_updates_url.is_empty() {
+                // Static-only: keep it as a `no_realtime` config, but only if the
+                // static feed is still active.
+                let active = gtfs_status
+                    .get(&slug)
+                    .is_some_and(|status| *status == Status::Active);
+                if !active {
+                    dropped_inactive += 1;
+                    continue;
+                }
+                static_only += 1;
             }
+            agencies.push(AgencyConfig {
+                slug,
+                display_name: build.display_name.unwrap_or_default(),
+                static_url,
+                realtime_urls: GtfsRtUrls {
+                    trip_updates_url: dedup(build.trip_updates_url),
+                    vehicle_positions_url: dedup(build.vehicle_positions_url),
+                },
+                gtfs_rt_requires_auth: build.gtfs_rt_requires_auth,
+                country_code: build.country_code,
+                location: build.location,
+            });
         }
 
         println!(
             "MobilityData catalog: {} agencies ({static_only} active static-only, no realtime; \
              {dropped_inactive} inactive static-only dropped; \
              {skipped} entries had neither a paired realtime nor a static feed)",
-            complete_agencies.len(),
+            agencies.len(),
         );
 
-        Ok(MobilityDataProvider {
-            agencies: complete_agencies,
-        })
+        Ok(MobilityDataProvider { agencies })
     }
 }
 

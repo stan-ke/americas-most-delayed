@@ -22,7 +22,7 @@ use anyhow::{Context, Result};
 use reverse_geocoder::ReverseGeocoder;
 use serde::Deserialize;
 
-use crate::agency::{AgencyConfig, GeoPoint, GtfsRtUrlSet};
+use crate::agency::{AgencyConfig, GeoPoint, GtfsRtUrls};
 use crate::catalogs::catalog::GtfsCatalogProvider;
 
 /// GitHub's zip export of the Transitland Atlas repo's default branch. `reqwest`
@@ -130,7 +130,7 @@ impl TransitlandProvider {
 
         let pollable = agencies
             .iter()
-            .filter(|a| !a.realtime_urls.trip_updates_url().is_empty())
+            .filter(|a| !a.realtime_urls.trip_updates_url.is_empty())
             .count();
         println!(
             "Transitland Atlas: {} agencies ({pollable} pollable, {} static-only)",
@@ -460,10 +460,9 @@ fn build_config(
         slug,
         display_name,
         static_url,
-        realtime_urls: GtfsRtUrlSet::Separate {
+        realtime_urls: GtfsRtUrls {
             trip_updates_url,
             vehicle_positions_url,
-            service_alerts_url: Vec::new(),
         },
         gtfs_rt_requires_auth,
         country_code,

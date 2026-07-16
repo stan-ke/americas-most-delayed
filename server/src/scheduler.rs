@@ -70,6 +70,12 @@ const PRINT_INTERVAL: Duration = Duration::from_secs(15);
 /// feed lights its LED up while you're looking at it. Affordable only because the
 /// tick sends a delta rather than the whole report (see [`crate::wire`]).
 const STATUS_INTERVAL: Duration = Duration::from_secs(2);
+/// How stale the freshest successful poll may get before `/api/healthz` reports
+/// unhealthy. With hundreds of feeds staggered across the poll rotation, at least
+/// one succeeds every couple of seconds even when every feed has backed off to
+/// [`MAX_INTERVAL`] — so this only trips if the whole loop wedges, not on normal
+/// backoff.
+const HEALTH_STALE_AFTER: u64 = 120;
 /// Directory for cached static GTFS zips.
 const CACHE_DIR: &str = "./feeds";
 /// Directory debug captures are written to (git-ignored, like `./feeds`). Only
@@ -272,6 +278,20 @@ pub struct StatusSummary {
     pub sqlite_peak_bytes: i64,
     /// Resident set size of the whole process (Linux only).
     pub process_rss_bytes: Option<u64>,
+}
+
+/// The `/api/healthz` response — see [`Scheduler::health`].
+#[derive(Debug, Clone, Serialize)]
+pub struct Health {
+    /// Whether the poll loop is turning. Drives the HTTP status: 200 vs 503.
+    pub ok: bool,
+    /// Feeds currently in the poll rotation.
+    pub active_sources: usize,
+    /// Seconds since the freshest successful poll across all feeds; `None` if none
+    /// has succeeded yet.
+    pub last_success_age_seconds: Option<u64>,
+    /// Why we're unhealthy, when we are.
+    pub reason: Option<&'static str>,
 }
 
 /// The full `/status` response.
@@ -484,21 +504,14 @@ impl Scheduler {
         let entities = {
             let _permit = self.limiter.acquire().await.expect("semaphore stays open");
             let mut entities = Vec::new();
-            for url in config.realtime_urls.trip_updates_url() {
+            for url in &config.realtime_urls.trip_updates_url {
                 entities.extend(realtime::fetch_feed(&self.client, url).await?.entity);
             }
             entities
         };
 
         let vehicle_count = entities.iter().filter(|e| e.trip_update.is_some()).count();
-        let feed = FeedMessage {
-            header: FeedHeader {
-                gtfs_realtime_version: "2.0".to_string(),
-                incrementality: None,
-                timestamp: None,
-            },
-            entity: entities,
-        };
+        let feed = feed_message(entities);
 
         let gtfs_missing = gtfs.is_none();
         let (delays, needs_schedule) = tokio::task::spawn_blocking(move || {
@@ -528,7 +541,7 @@ impl Scheduler {
     /// [`limiter`](Self::limiter).
     async fn update_vehicle_positions(&self, idx: usize) {
         let config = &self.configs[idx];
-        let urls = config.realtime_urls.vehicle_positions_url();
+        let urls = &config.realtime_urls.vehicle_positions_url;
         if urls.is_empty() {
             return;
         }
@@ -710,6 +723,51 @@ impl Scheduler {
     /// compression, while the HTTP layer does (see [`crate::api`]).
     pub fn status_full(&self) -> String {
         self.source_status.lock().unwrap().full()
+    }
+
+    /// A cheap liveness/readiness check for `GET /api/healthz`.
+    ///
+    /// "Running well" here means the poll loop is actually turning, not merely that
+    /// the process is up and axum answers — a wedged scheduler would still serve
+    /// this endpoint while every feed went stale. So the signal is the freshest
+    /// successful poll across all sources: if the newest one is older than
+    /// [`HEALTH_STALE_AFTER`] (or none has happened yet), we're not healthy.
+    ///
+    /// Deliberately not built on [`status_report`](Self::status_report) — a load
+    /// balancer may hit this every few seconds, and this is one lock and a scan of
+    /// small `Copy` fields, not a 504-row serialization.
+    pub fn health(&self) -> Health {
+        let status = self.status.lock().unwrap();
+
+        let active = status
+            .iter()
+            .filter(|runtime| runtime.state == SourceState::Active)
+            .count();
+        // The most recent *successful* poll anywhere. A failed poll still sets
+        // last_poll, but a scheduler that's only failing isn't healthy, so we key
+        // on success.
+        let last_poll = status
+            .iter()
+            .filter(|runtime| runtime.last_success == Some(true))
+            .filter_map(|runtime| runtime.last_poll)
+            .max();
+
+        let now = unix_now();
+        let poll_age = last_poll.map(|t| now.saturating_sub(t));
+        let ok = poll_age.is_some_and(|age| age <= HEALTH_STALE_AFTER);
+
+        Health {
+            ok,
+            active_sources: active,
+            last_success_age_seconds: poll_age,
+            reason: if ok {
+                None
+            } else if last_poll.is_none() {
+                Some("no feed has been polled successfully yet (warming up)")
+            } else {
+                Some("no successful poll within the freshness window (scheduler stalled?)")
+            },
+        }
     }
 
     /// Build the current global leaderboard: the worst [`LEADERBOARD_SIZE`]
@@ -900,25 +958,20 @@ impl Scheduler {
         // Re-fetch the realtime feeds *now* so the archive captures the current
         // state. Each fetch is best-effort: a failure is recorded, not fatal.
         let mut tu_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
-        for url in config.realtime_urls.trip_updates_url() {
+        for url in &config.realtime_urls.trip_updates_url {
             let bytes = realtime::fetch_bytes(&self.client, url)
                 .await
                 .map_err(|e| format!("{e:#}"));
             tu_raw.push((url.clone(), bytes));
         }
         let mut vp_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
-        for url in config.realtime_urls.vehicle_positions_url() {
+        for url in &config.realtime_urls.vehicle_positions_url {
             let bytes = realtime::fetch_bytes(&self.client, url)
                 .await
                 .map_err(|e| format!("{e:#}"));
             vp_raw.push((url.clone(), bytes));
         }
 
-        let header = || FeedHeader {
-            gtfs_realtime_version: "2.0".to_string(),
-            incrementality: None,
-            timestamp: None,
-        };
         let decode_all = |raw: &[(String, std::result::Result<Vec<u8>, String>)]| {
             let mut entity = Vec::new();
             for (_, bytes) in raw {
@@ -928,10 +981,7 @@ impl Scheduler {
                     entity.extend(feed.entity);
                 }
             }
-            FeedMessage {
-                header: header(),
-                entity,
-            }
+            feed_message(entity)
         };
         let tu_feed = decode_all(&tu_raw);
         let vp_feed = decode_all(&vp_raw);
@@ -984,8 +1034,8 @@ impl Scheduler {
                 "display_name": config.display_name,
                 "country_code": config.country_code,
                 "static_url": config.static_url,
-                "trip_updates_urls": config.realtime_urls.trip_updates_url(),
-                "vehicle_positions_urls": config.realtime_urls.vehicle_positions_url(),
+                "trip_updates_urls": config.realtime_urls.trip_updates_url,
+                "vehicle_positions_urls": config.realtime_urls.vehicle_positions_url,
                 "requires_auth": config.requires_auth(),
                 "state": state,
                 "hot": r.hot,
@@ -1276,6 +1326,21 @@ impl Scheduler {
             ticker.tick().await;
             self.broadcast_status();
         }
+    }
+}
+
+/// Wrap decoded entities in a `FeedMessage`. GTFS-realtime requires a header, but
+/// nothing downstream reads ours — we only ever assemble feeds to run through the
+/// delay pipeline (merging several trip-updates URLs, or re-decoding for a debug
+/// capture), so a minimal `2.0` header is all it needs.
+fn feed_message(entity: Vec<gtfs_rt::FeedEntity>) -> FeedMessage {
+    FeedMessage {
+        header: FeedHeader {
+            gtfs_realtime_version: "2.0".to_string(),
+            incrementality: None,
+            timestamp: None,
+        },
+        entity,
     }
 }
 

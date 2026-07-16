@@ -1,13 +1,31 @@
-name = "America's Most Delayed"
+[project]
 slug = "americas-most-delayed"
+name = "America's Most Delayed"
+description = "Live leaderboard of the most delayed transit in America"
+status = "live"
+repo = "https://github.com/stan.ke/americas-most-delayed"
 
-[components]
 [components.server]
-type = "dynamic"
-from = "container"
+kind = "docker"
+path = "server/"
+port = 8080
+restart = "avoid"
 
-[components.server.hints]
-avoid_restarts = true
+[components.server.healthcheck]
+path = "/healthz"
+expect_status = 200
+interval = "60s"
+grace = "90s"
 
 [components.static]
-type = "static"
+kind = "static"
+path = "static/"
+host = "gh-pages"
+
+[components.static.deploy]
+url = "https://stan.ke/americas-most-delayed"
+
+[[components.static.substitutions]]
+file = "static/config.js"
+find = "<api_url>"
+replace = "${components.server.url}"

@@ -64,6 +64,7 @@ pub async fn serve(scheduler: Shared) -> Result<()> {
         .allow_headers([header::CONTENT_TYPE]);
 
     let app = Router::new()
+        .route("/healthz", get(healthz))
         .route("/api/status", get(status))
         .route("/api/status/live", get(status_live))
         .route("/api/shape/{slug}/{trip_id}", get(shape))
@@ -75,15 +76,26 @@ pub async fn serve(scheduler: Shared) -> Result<()> {
 
     let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
     println!("Serving the API on http://{}", listener.local_addr()?);
-    println!("  GET /api/status      — full source-health report (fetch once)");
-    println!("  WS  /api/status/live — source-health deltas");
-    println!("  WS  /api/subscribe   — live leaderboard, pushed every 15s");
-    println!("  GET /api/shape/…     — a trip's route path (encoded polyline)");
-    println!("  POST /api/debug/capture — archive one entry's data (AMD_DEBUG)");
-    println!("The pages live in ../static (GitHub Pages) and read this API.");
 
     axum::serve(listener, app).await?;
     Ok(())
+}
+
+/// `GET /api/healthz`: is the poll loop turning?
+///
+/// **200** with the health JSON when a feed has been polled successfully recently,
+/// **503** with the same JSON (carrying `reason`) when not — so a load balancer or
+/// uptime check can gate on the status code while a human still gets the detail.
+/// See [`Scheduler::health`] for what "healthy" means and why it's cheap enough to
+/// poll often.
+async fn healthz(State(scheduler): State<Shared>) -> Response {
+    let health = scheduler.health();
+    let code = if health.ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (code, Json(health)).into_response()
 }
 
 /// `GET /api/status`: the whole source-health report, `seq` included.
