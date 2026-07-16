@@ -5,8 +5,11 @@
 //! incrementally (see `catalogs::mobilitydata`) before handing over a complete
 //! config here.
 
+<<<<<<< Updated upstream
 use crate::auth::{self, FeedAuth};
 
+=======
+>>>>>>> Stashed changes
 /// Static description of one transit feed we monitor.
 #[derive(Debug, Clone)]
 pub struct AgencyConfig {
