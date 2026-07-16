@@ -135,6 +135,36 @@ rotation (see `SourceState` below).
 New catalog sources should implement the `GtfsCatalogProvider` trait
 (`catalogs/catalog.rs`) and be added as a `CatalogSource` variant in `main.rs`.
 
+### Feed authentication (`auth.rs`)
+
+A handful of agencies gate their realtime feeds behind an API key. `auth.rs` is the
+one place that knows about those credentials, and it keeps the **secrets out of the
+source tree**: `FeedAuth::load` reads them at startup from a **git-ignored
+`keys.env`** (`KEY=value` lines; path overridable with `AMD_KEYS_FILE`), so the keys
+an operator is handed are dropped into `keys.env` and never committed. A missing
+file is fine — the gated feeds are simply skipped.
+
+The mechanism is **host-matched injection**, decoupled from the catalog:
+`FeedAuth::apply(client, url)` builds a request for `url` and, for any rule in
+`INJECTIONS` whose host matches, injects the credential as either a request
+**header** or a **query parameter** (path-embedded credentials, like TriMet's app
+id, are spliced into the URL when the config is built instead). It's called on
+*every* outbound realtime fetch in `realtime.rs`; a URL matching no rule — nearly
+all of them — passes through untouched. To authenticate a new header/query feed:
+add its secret to `keys.env` and one line to `INJECTIONS`.
+
+The `Scheduler` holds the shared `Arc<FeedAuth>` and threads it into every
+`realtime::fetch_feed`/`fetch_bytes` call. The gated agencies themselves are
+**hand-configured** in `agency::authed_agencies` (prepended after NJ Transit so they
+win cross-catalog dedup over the catalogs' `requires_auth` copies), each built only
+when its key is present: STM and OC Transpo (header), MTA Bus Time and the Puget
+Sound OneBusAway server (query — Puget Sound merges *all* of its per-agency feeds
+into one config), and TriMet (path app id). It also hand-configures the **MTA
+subway** feeds, which are *open* (no key) but which the catalogs mislabel as
+`no_realtime`. Unit tests cover the injection mechanism; an `#[ignore]`d
+`live_feeds_authenticate` test (run with `cargo test -- --ignored`, needs `keys.env`)
+fetches every hand-configured feed end-to-end.
+
 ### The dynamic polling scheduler (`scheduler.rs`) — the core
 
 This is where the "big picture" lives; understanding it requires reading

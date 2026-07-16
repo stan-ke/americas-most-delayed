@@ -32,6 +32,7 @@ use serde_json::{Map, Value, json};
 use tokio::sync::{Semaphore, broadcast};
 
 use crate::agency::AgencyConfig;
+use crate::auth::FeedAuth;
 use crate::delay::{self, DelayedTrip, TripObservation, VehiclePositions};
 use crate::gtfs::{self, Gtfs};
 use crate::history::TripHistory;
@@ -318,6 +319,8 @@ pub struct Scheduler {
     configs: Vec<AgencyConfig>,
     /// Shared async HTTP client (cheap to clone; connection-pooled internally).
     client: Client,
+    /// Per-host feed credentials, injected into requests to gated feeds.
+    auth: Arc<FeedAuth>,
     /// Caps how many feed fetches are in flight at once.
     limiter: Semaphore,
     /// Latest delayed trips per agency index; the leaderboard is derived from it.
@@ -351,7 +354,7 @@ pub struct Scheduler {
 }
 
 impl Scheduler {
-    fn new(configs: Vec<AgencyConfig>, client: Client, debug: bool) -> Self {
+    fn new(configs: Vec<AgencyConfig>, client: Client, auth: Arc<FeedAuth>, debug: bool) -> Self {
         // Seed each source's state from its config: auth-gated feeds start (and
         // stay) `RequiresAuth`; everything else joins the poll rotation.
         let status = configs
@@ -376,6 +379,7 @@ impl Scheduler {
         Scheduler {
             configs,
             client,
+            auth,
             limiter: Semaphore::new(MAX_CONCURRENT_POLLS),
             boards: Mutex::new(HashMap::new()),
             positions: Mutex::new(HashMap::new()),
@@ -505,7 +509,7 @@ impl Scheduler {
             let _permit = self.limiter.acquire().await.expect("semaphore stays open");
             let mut entities = Vec::new();
             for url in &config.realtime_urls.trip_updates_url {
-                entities.extend(realtime::fetch_feed(&self.client, url).await?.entity);
+                entities.extend(realtime::fetch_feed(&self.client, &self.auth, url).await?.entity);
             }
             entities
         };
@@ -550,7 +554,7 @@ impl Scheduler {
         {
             let _permit = self.limiter.acquire().await.expect("semaphore stays open");
             for url in urls {
-                match realtime::fetch_feed(&self.client, url).await {
+                match realtime::fetch_feed(&self.client, &self.auth, url).await {
                     Ok(feed) => positions.extend(delay::vehicle_positions(&feed)),
                     Err(err) => eprintln!(
                         "[{}] vehicle positions fetch failed: {err:#}",
@@ -959,14 +963,14 @@ impl Scheduler {
         // state. Each fetch is best-effort: a failure is recorded, not fatal.
         let mut tu_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
         for url in &config.realtime_urls.trip_updates_url {
-            let bytes = realtime::fetch_bytes(&self.client, url)
+            let bytes = realtime::fetch_bytes(&self.client, &self.auth, url)
                 .await
                 .map_err(|e| format!("{e:#}"));
             tu_raw.push((url.clone(), bytes));
         }
         let mut vp_raw: Vec<(String, std::result::Result<Vec<u8>, String>)> = Vec::new();
         for url in &config.realtime_urls.vehicle_positions_url {
-            let bytes = realtime::fetch_bytes(&self.client, url)
+            let bytes = realtime::fetch_bytes(&self.client, &self.auth, url)
                 .await
                 .map_err(|e| format!("{e:#}"));
             vp_raw.push((url.clone(), bytes));
@@ -1543,7 +1547,7 @@ fn format_delay(seconds: i64) -> String {
 /// staggered across [`BASE_INTERVAL`]) plus the printer/broadcast ticker, and
 /// return the shared [`Scheduler`] handle for the API layer to read. Must be
 /// called from within a Tokio runtime.
-pub fn start(configs: Vec<AgencyConfig>) -> Result<Arc<Scheduler>> {
+pub fn start(configs: Vec<AgencyConfig>, auth: Arc<FeedAuth>) -> Result<Arc<Scheduler>> {
     let client = Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)
@@ -1552,7 +1556,7 @@ pub fn start(configs: Vec<AgencyConfig>) -> Result<Arc<Scheduler>> {
     if debug {
         println!("Debug capture enabled (AMD_DEBUG): per-row capture buttons active");
     }
-    let scheduler = Arc::new(Scheduler::new(configs, client, debug));
+    let scheduler = Arc::new(Scheduler::new(configs, client, auth, debug));
 
     let pollable = scheduler.pollable();
     let count = pollable.len();
