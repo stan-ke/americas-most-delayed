@@ -423,6 +423,9 @@ so the egress discipline the rest of the crate lives by (`wire.rs`) doesn't bind
 one scrape every 15–60s from one Prometheus is not 500 browser tabs, which is what
 frees it to be comprehensive.
 
+If `METRICS_BEARER_AUTH` is set, `/metrics` requires an `Authorization` header
+whose token matches that env var; when unset/empty, `/metrics` remains open.
+
 The metrics split into the two kinds that shape the module:
 
 - **Counters** — cumulative process-lifetime events, incremented at the point they

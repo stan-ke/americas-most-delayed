@@ -29,7 +29,7 @@ use axum::{
         Path, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
-    http::{HeaderValue, Method, StatusCode, header},
+    http::{HeaderMap, HeaderValue, Method, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -64,6 +64,26 @@ fn port() -> u16 {
 /// a service day, and the static schedule behind it is only refreshed every 24h —
 /// so this is a day of shape fetches that never leave the browser.
 const SHAPE_CACHE: &str = "public, max-age=86400";
+
+/// Optional bearer token that protects `GET /metrics`. Empty/missing means metrics
+/// remain unauthenticated.
+fn metrics_bearer_auth() -> Option<String> {
+    std::env::var("METRICS_BEARER_AUTH")
+        .ok()
+        .filter(|value| !value.is_empty())
+}
+
+/// Constant-time string equality for auth-token checks.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.bytes().zip(right.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
 
 type Shared = Arc<Scheduler>;
 
@@ -119,7 +139,23 @@ async fn healthz(State(scheduler): State<Shared>) -> Response {
 /// Cumulative counters live in the registry and are read as-is; the gauge-style
 /// metrics are snapshotted from the scheduler's live state right here, at scrape
 /// time, so they're always fresh without any per-tick bookkeeping.
-async fn metrics(State(scheduler): State<Shared>) -> Response {
+async fn metrics(State(scheduler): State<Shared>, headers: HeaderMap) -> Response {
+    if let Some(expected) = metrics_bearer_auth() {
+        let authorized = headers
+            .get(header::AUTHORIZATION)
+            .and_then(|value| value.to_str().ok())
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| constant_time_eq(token, &expected));
+        if !authorized {
+            return (
+                StatusCode::UNAUTHORIZED,
+                [(header::WWW_AUTHENTICATE, HeaderValue::from_static("Bearer"))],
+                "Unauthorized",
+            )
+                .into_response();
+        }
+    }
+
     scheduler.metrics().record_http("metrics");
     let body = scheduler.metrics().render(&scheduler.gauge_values());
     (
