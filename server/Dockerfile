@@ -11,8 +11,17 @@ RUN CARGO_INCREMENTAL=0 cargo build --release --target x86_64-unknown-linux-musl
 # Verify the binary is statically linked
 RUN ldd target/x86_64-unknown-linux-musl/release/server || true
 
-FROM gcr.io/distroless/static:latest
+# FROM gcr.io/distroless/static:latest
+# WORKDIR /app
+# COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server ./
+# EXPOSE 8080
+# CMD ["/app/server"]
+
+# Go alpine instead for healthcheck
+FROM alpine:latest AS runtime
 WORKDIR /app
-COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server ./
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server /app/server
 EXPOSE 8080
+HEALTHCHECK --interval=30s --timeout=5s --start-period=30s --retries=3 \
+  CMD wget -qO- http://localhost:8080/healthz || exit 1
 CMD ["/app/server"]
