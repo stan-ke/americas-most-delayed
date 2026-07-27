@@ -1,0 +1,104 @@
+# Development / testing stack for "America's Most Delayed".
+#
+# Brings up the four moving parts locally:
+#   server     — the Rust API (built from ./server/Dockerfile), on :8080
+#   static     — the GitHub-Pages half, served by nginx on :3000
+#   prometheus — scrapes the server's /metrics, on :9090
+#   grafana    — dashboards over Prometheus, on :3001
+#
+# This is NOT the production deployment (see static/README.md). In prod the two
+# halves live on different hosts; here they share a Docker network so Prometheus can
+# reach the server by name. The browser, however, is outside that network: config.js
+# points the static page at http://localhost:8080, which is why the server's port is
+# published to the host.
+#
+#   docker compose up --build
+#
+# The server fetches the live feed catalogs at startup and then downloads a static
+# GTFS zip per agency into ./server/feeds (a named volume here), so the first run
+# pulls a lot over the network and takes a while to warm up. The leaderboard is
+# intentionally cold for the first several minutes — see server/CLAUDE.md
+# ("cold after a restart").
+
+services:
+  server:
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    image: amd-server:dev
+    ports:
+      # host:container. The server binds whatever PORT it's given (below); keep the
+      # container side in sync with it.
+      - "8080:8080"
+    environment:
+      # Port the server binds inside the container (read by src/api.rs).
+      PORT: "8080"
+      # Any non-empty value but 0/false/no turns on the 🐛/🧮 debug columns.
+      AMD_DEBUG: "1"
+    volumes:
+      # auth.json is checked in and secret-free; keys.env holds the feed API keys
+      # and is git-ignored. Both are read from the working dir (/app) at startup.
+      # keys.env is optional — without it the gated feeds are simply skipped.
+      - ./server/auth.json:/app/auth.json:ro
+      - ./server/keys.env:/app/keys.env:ro
+      # Cached static GTFS zips + their SQLite sidecars. A named volume so the
+      # expensive first-run census survives `docker compose down` (use `-v` to wipe).
+      - amd-feeds:/app/feeds
+      # Debug captures (AMD_DEBUG) land here; handy to inspect from the host.
+      - ./server/debug:/app/debug
+    # No healthcheck: the distroless image ships only the binary — no shell, curl,
+    # or wget to probe /healthz with. Health is observable via Prometheus (the
+    # amd_last_successful_poll_timestamp_seconds metric) or `curl localhost:8080/healthz`
+    # from the host.
+    restart: unless-stopped
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  static:
+    image: nginx:alpine
+    ports:
+      - "3000:80"
+    volumes:
+      # The GitHub-Pages root, served as-is. config.js already retargets itself at
+      # http://localhost:8080 when the page is loaded from localhost, so no build
+      # step or env wiring is needed for local use.
+      - ./static:/usr/share/nginx/html:ro
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./server/monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - amd-prometheus:/prometheus
+    depends_on:
+      - server
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      # Dev-only: no login wall, land straight on the dashboards.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Admin"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_SECURITY_ADMIN_PASSWORD: "admin"
+    volumes:
+      - ./server/monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - amd-grafana:/var/lib/grafana
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  amd-feeds:
+  amd-prometheus:
+  amd-grafana:

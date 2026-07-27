@@ -2,6 +2,12 @@
 
 This file provides guidance to Claude Code (claude.ai/code) when working with code in this repository.
 
+## Working agreement
+
+**Never create pull requests on your own accord.** All work stays local — edit the
+working tree, and commit only when asked. Opening a PR (or pushing a branch to set
+one up) is the user's call, every time, not a way to wrap up a task.
+
 ## What this is
 
 "America's Most Delayed" — a wall of shame for late public transit. A single Rust
@@ -32,10 +38,6 @@ halves" below, and `../static/README.md` for deployment.
   3000`). `config.js` points itself at `http://localhost:8080` when the page is
   served from localhost, so a local `cargo run` is all it needs.
 
-There is **no test suite** yet — `cargo test` runs nothing. Verify changes by
-running the binary and watching the leaderboard output, or hitting the API:
-`curl localhost:8080/api/status` and a websocket client on
-`ws://localhost:8080/api/subscribe`.
 
 Note when running under a wrapper: `cargo run` spawns the `server` binary as a
 child, so a `timeout`/kill on `cargo` can orphan the running server. Run the
@@ -44,8 +46,8 @@ built binary directly (`./target/debug/server`) when you need a hard timeout.
 ## Architecture
 
 The pipeline is: **catalog → agency configs → dynamic parallel polling →
-realtime feeds → delay computation → provenance vetting → leaderboard → delta
-stream → API**.
+realtime feeds → delay computation → provenance vetting → scoring + retention →
+leaderboard → delta stream → API**.
 
 The whole binary is **async** (Tokio, `#[tokio::main]`). `main.rs` awaits the
 catalog fetch, then `scheduler::start` spawns the polling tasks and returns the
@@ -138,32 +140,91 @@ New catalog sources should implement the `GtfsCatalogProvider` trait
 ### Feed authentication (`auth.rs`)
 
 A handful of agencies gate their realtime feeds behind an API key. `auth.rs` is the
-one place that knows about those credentials, and it keeps the **secrets out of the
-source tree**: `FeedAuth::load` reads them at startup from a **git-ignored
-`keys.env`** (`KEY=value` lines; path overridable with `AMD_KEYS_FILE`), so the keys
-an operator is handed are dropped into `keys.env` and never committed. A missing
-file is fine — the gated feeds are simply skipped.
+one place that knows *how* those credentials are applied — but the **rules are data,
+not code**: both the injection rules and the gated agency configs live in a
+checked-in, secret-free **`auth.json`** (path overridable with `AMD_AUTH_FILE`).
+Adding an authenticated agency is a JSON edit plus a secret in `keys.env` — no
+recompile. A missing or malformed `auth.json` degrades gracefully (logged, treated
+as empty) rather than aborting startup.
+
+The **secrets stay out of the source tree** *and* out of `auth.json`: `FeedAuth::load`
+reads them at startup from a **git-ignored `keys.env`** (`KEY=value` lines; path
+overridable with `AMD_KEYS_FILE`), so the keys an operator is handed are dropped into
+`keys.env` and never committed. `auth.json` references credentials only by **name**;
+the value is looked up in `keys.env` at fetch/build time. A missing `keys.env` is
+fine — the gated feeds are simply skipped.
 
 The mechanism is **host-matched injection**, decoupled from the catalog:
 `FeedAuth::apply(client, url)` builds a request for `url` and, for any rule in
-`INJECTIONS` whose host matches, injects the credential as either a request
-**header** or a **query parameter** (path-embedded credentials, like TriMet's app
-id, are spliced into the URL when the config is built instead). It's called on
-*every* outbound realtime fetch in `realtime.rs`; a URL matching no rule — nearly
-all of them — passes through untouched. To authenticate a new header/query feed:
-add its secret to `keys.env` and one line to `INJECTIONS`.
+`auth.json`'s `injections` whose host matches, injects the credential as either a
+request **header** (`{"header": "apiKey"}`) or a **query parameter**
+(`{"query": "key"}`). It's called on *every* outbound realtime fetch in
+`realtime.rs`; a URL matching no rule — nearly all of them — passes through
+untouched. **Path-embedded credentials** (TriMet's app id) need no bespoke Rust:
+they use a `{KEY}` placeholder in the agency's URLs, which `FeedAuth::authed_agencies`
+substitutes from `keys.env` at build time (an unresolved placeholder drops the
+agency). To authenticate a new header/query feed: add its secret to `keys.env` and
+one entry to `injections`.
 
 The `Scheduler` holds the shared `Arc<FeedAuth>` and threads it into every
-`realtime::fetch_feed`/`fetch_bytes` call. The gated agencies themselves are
-**hand-configured** in `agency::authed_agencies` (prepended after NJ Transit so they
-win cross-catalog dedup over the catalogs' `requires_auth` copies), each built only
-when its key is present: STM and OC Transpo (header), MTA Bus Time and the Puget
-Sound OneBusAway server (query — Puget Sound merges *all* of its per-agency feeds
-into one config), and TriMet (path app id). It also hand-configures the **MTA
-subway** feeds, which are *open* (no key) but which the catalogs mislabel as
-`no_realtime`. Unit tests cover the injection mechanism; an `#[ignore]`d
-`live_feeds_authenticate` test (run with `cargo test -- --ignored`, needs `keys.env`)
-fetches every hand-configured feed end-to-end.
+`realtime::fetch_feed`/`fetch_bytes` call. The gated agencies themselves are the
+`agencies` array in `auth.json`, built by `FeedAuth::authed_agencies` (prepended
+after NJ Transit so they win cross-catalog dedup over the catalogs' `requires_auth`
+copies). Each entry with a `requires_key` is built only when that key is present:
+STM and OC Transpo (header), MTA Bus Time and the Puget Sound OneBusAway server
+(query — Puget Sound merges *all* of its per-agency feeds into one config), and
+TriMet (path app id via `{TRIMET_APP_ID}`). The **MTA subway** feeds are listed with
+no `requires_key` — they're *open* (no key) but the catalogs mislabel them
+`no_realtime`, so they're always built. **MTA Bus's** one realtime feed (obanyc)
+spans all five boroughs, but each borough publishes a separate static zip, so its
+config lists the other four in `extra_static_urls` (merged into one schedule index —
+see `gtfs.rs`), letting non-Manhattan trips resolve stop names and route shapes. The credential-name set for the startup
+summary is derived from the config (injection keys + `requires_key`s + `{KEY}`
+placeholders), not a hand-maintained list.
+
+### The score, and why finished trips stay (`score.rs`)
+
+The board is **not** a sort on `delay_seconds` any more. It ranks on a hidden
+**score**, and a trip that has *finished running* keeps its place and decays off over
+24 hours. Read `score.rs`'s module doc for the reasoning; the shape is:
+
+```
+score = minutes_late
+      × severity   (1.0 … 1.8)   delay ÷ scheduled trip length, saturating at 150%
+      × reach      (1.0 … 1.5)   stops still ahead, log-scaled, saturating at 30
+      × confidence (0.6 … 1.0)   share of the delay that accrued under observation,
+                                 plus how long we watched (full credit at 30m)
+      × decay      (0.0 … 1.0)   1.0 while live; see below once finished
+```
+
+Three rules hold this together and are worth not breaking:
+
+- **Every factor is a multiplier on minutes late, floored at (or near) 1.0.** That's
+  what keeps the board recognisably a delay ranking: nothing here can promote a
+  4-minute trip over a 90-minute one, the factors only reorder trips already in the
+  same league.
+- **An unknown input scores 1.0 — neutral, never a penalty.** A feed with no static
+  schedule loaded, or one that publishes no stop sequence, must not be quietly
+  demoted for what we don't know about it.
+- **The score is hidden.** It isn't displayed, and outside debug mode it isn't even
+  serialized. It's an ordering, not a statistic, and an unverifiable number is worse
+  than useless on a page whose entire claim is that its delays are real. What the page
+  shows is the delay, the provenance receipts, and how long ago a finished trip ended.
+
+**Decay** is `exp(-age/4h) × (1 - age/24h)`, clamped to zero at 24h. Two curves,
+because neither alone works: the exponential gives the steep early falloff (an
+ordinary finished trip is out of contention within the hour) over a long tail, and
+the linear taper forces it to actually reach **zero** — an exponential never does,
+and "asymptotically small" is a different promise from "gone". Without the taper a
+sufficiently absurd delay could homestead the wall forever and the board would become
+a museum. Retention: ~75% at 1h, ~41% at 3h, ~17% at 6h, ~2.5% at 12h, nothing at 24h.
+So a trip still there the next morning out-scored the live board by ~40× — which is
+the point.
+
+`peak_delay_seconds` (the worst vetted delay a trip reached), not the latest reading,
+is what's scored and displayed. For a live trip the growth bound in `history.rs` makes
+these nearly identical; it matters for a finished trip, whose final frame may be a
+revised-down estimate that isn't what the run should be remembered for.
 
 ### The dynamic polling scheduler (`scheduler.rs`) — the core
 
@@ -183,21 +244,67 @@ This is where the "big picture" lives; understanding it requires reading
   to `MAX_INTERVAL` (5 min); the moment it re-enters the top, it snaps back to
   base. This is the whole point of the design — quiet feeds cost almost no
   network.
+- **`boards` is not the leaderboard.** `boards` holds each feed's *live* working set,
+  replaced wholesale every poll; the board is built from **`archive`**
+  (`HashMap<agency_idx, HashMap<trip_id, TripRecord>>`), which trips **outlive their
+  own runs** in. This is the restructure the decaying score needed: the old design
+  could only show what a feed was reporting right now, so the worst trip of the day
+  vanished the instant it finally pulled in. Each poll folds its board into the
+  archive (`record_board`, an upsert — a known trip keeps its identity, peak, birth
+  and first sighting). A `TripRecord` **freezes** everything a finished entry will
+  still need — position, provenance receipts, static span — because by the time it's
+  rendered hours later the positions map has moved on and `TripHistory` has forgotten
+  the trip. `sweep_archive` (on the 15s ticker) then ages it in three passes: *retire*
+  a trip unmentioned for `TRIP_END_GRACE` (10 min, comfortably over `MAX_INTERVAL`)
+  by stamping `ended_at` at its **last sighting** — not at when we noticed, so a slow
+  feed doesn't buy its trips extra time on the wall; *expire* anything past 24h, where
+  the score is already exactly zero; and *cap* the finished set to `ARCHIVE_CAP`
+  (400), since the 24h horizon bounds memory only loosely.
+- Trips leave the archive by three routes besides decaying out, and the distinctions
+  are load-bearing: a trip the history **falsifies** mid-life is *evicted* (it would
+  otherwise stop being refreshed, get stamped "finished", and spend a day decaying on
+  a delay we now know was a stale label — this is why `TripHistory::vet` returns the
+  refused **ids**, not just a count); an **off-route** vehicle is *evicted* for the
+  same reason; but a vehicle **at a terminal** is stamped **finished on the spot**,
+  because that is what an arrival looks like — freezing the last honest interior delay
+  and starting its decay immediately rather than waiting out the grace period.
+  `record_board` clears `ended_at` on any trip still being reported, so a feed that
+  skipped a beat — or a vehicle that pulls away from a layover and is genuinely late
+  again — gets its place back instead of decaying while still running.
 - The **top-25 membership signal drives three decisions at once**: the fast poll
   interval, lazy static-GTFS loading, and fetching **live vehicle positions**.
-  `leaderboard_contains` answers "is this feed hot?" with an allocation-free O(n)
-  count (how many trips beat this feed's best), not a sort — it runs on every poll.
+  `on_leaderboard` answers "is this feed hot?" with an allocation-free O(n) count (how
+  many records beat this feed's best), not a sort — it runs on every poll. It's keyed
+  on **score, not delay** (the two no longer agree, and a short trip that scores its
+  way onto the board must still earn the positions fetch that verifies it), and on
+  this feed's best **live** trip only — a feed whose sole presence is a finished trip
+  fading out has nothing worth polling fast for — while competing against *all*
+  records, live and finished. `poll_once` therefore calls `record_board` **before**
+  asking whether the feed is hot: a trip not yet in the archive can't be seen to be
+  winning.
   When a feed is hot, `update_vehicle_positions` also fetches its GTFS-realtime
   `VehiclePositions` feed and stores per-`trip_id` coordinates (`positions`); the
   leaderboard snapshot joins those onto each entry's `latitude`/`longitude` so the
   frontend can map the delayed vehicle. Fetching only for hot feeds keeps this off
   the ~1200 cold feeds. (`(0,0)` "null island" fixes are dropped in `delay.rs`.)
-  `update_vehicle_positions` also **verifies each ranked trip is on its route**:
-  a trip whose live vehicle sits more than `OFF_ROUTE_KM` (2km) from its shape
-  (`distance_to_path_km`, point-to-segment) is a mismatched trip/vehicle and is
-  dropped from the board, so it never reaches the leaderboard. `poll_once` therefore
-  recomputes hotness *after* fetching positions: a feed whose only delayed trips
-  were off-route drops out of the top N and backs off. A feed with trip updates but
+  `update_vehicle_positions` also uses those coordinates to **drop two kinds of bad
+  ranked trip from the board** (`drop_offroute_trips`), keeping the leaderboard to
+  vehicles genuinely late *en route*: (1) **off-route** — a vehicle more than
+  `OFF_ROUTE_KM` (2km) from its shape (`distance_to_path_km`, point-to-segment) is a
+  mismatched trip/vehicle; (2) **at a terminal** — a vehicle within `TERMINAL_KM`
+  (0.4km) of *either end* of its shape (its start or final terminal, i.e. the first
+  or last shape point) is parked at a layover, not late en route, so its reported
+  delay is spurious (a run that hasn't departed, or a finished run going stale — the
+  same rationale as the schedule-based terminal-stop rule in `delay.rs`, but keyed on
+  the vehicle's live *position* rather than its current stop's sequence, which catches
+  a parked bus whose delay is read at an interior stop). A dropped trip is only held
+  off the *live* board — its provenance history keeps accruing (the observation is
+  vetted independently in `poll_once`), so once it pulls away from the terminal and is
+  genuinely late it can rank on its watched record. In the archive the two cases
+  diverge: off-route is evicted as bad data, at-terminal is stamped finished (see
+  above). `poll_once` therefore recomputes
+  hotness *after* fetching positions: a feed whose only delayed trips were off-route
+  or terminal-parked drops out of the top N and backs off. A feed with trip updates but
   **no vehicle-positions feed** can't be verified this way, so it's excluded from
   polling entirely (`SourceState::NoVehiclePositions`) — only ~6% of feeds.
 - A single `run_ticker` task renders the leaderboard every `PRINT_INTERVAL` (15s).
@@ -214,7 +321,12 @@ This is where the "big picture" lives; understanding it requires reading
   poll — see below), `NoVehiclePositions` (has trip updates but no vehicle-positions
   feed to verify routes against, so excluded), or `Failed(status)`. A poll that returns a `FATAL_STATUSES`
   code (401/404) retires the source: state → `Failed`, board cleared, and its task
-  ends (never rescheduled). Only `Active` sources are polled (`pollable()`).
+  ends (never rescheduled). But a feed that merges **several trip-updates URLs**
+  (Puget Sound polls one per OBA agency, MTA subway one per line) tolerates a
+  per-URL failure: `fetch_delayed_trips` logs a failed sub-feed and presses on with
+  whatever answered, propagating an error (and so risking retirement) only when
+  *every* URL failed — otherwise one auth-gated OBA agency returning 401 would sink
+  the whole merged source. Only `Active` sources are polled (`pollable()`).
   `status_report()` serializes all this (plus each source's `total_trips`) for
   `/status`, but **trims the `NoRealtime` feeds to the largest `NO_REALTIME_DISPLAY`
   (100) by `total_trips`** — so the status page highlights the biggest agencies
@@ -302,9 +414,52 @@ was during warmup, when every feed still polls at the 20s base interval — it s
 lower as feeds back off); leaderboard **52 → 22 MB/day**; a route shape
 **27 KB → 2.4 KB**.
 
+### Prometheus metrics (`metrics.rs`)
+
+`GET /metrics` exposes the whole pipeline in **OpenMetrics** text via the **official
+Prometheus Rust client** (`prometheus-client`). This is instrumentation for the
+**operator's own** Prometheus, scraped server-side — *not* the public frontend API —
+so the egress discipline the rest of the crate lives by (`wire.rs`) doesn't bind it:
+one scrape every 15–60s from one Prometheus is not 500 browser tabs, which is what
+frees it to be comprehensive.
+
+The metrics split into the two kinds that shape the module:
+
+- **Counters** — cumulative process-lifetime events, incremented at the point they
+  happen from the scheduler's hot paths and the API handlers: `amd_polls_total`
+  (by `result`), `amd_source_retirements_total`, `amd_trips_vetted_out_total`,
+  `amd_trips_evicted_total` / `amd_trips_finished_total` (by `reason` —
+  off_route/falsified, terminal/grace), `amd_static_loads_total` /
+  `amd_static_census_total`, `amd_http_requests_total` (by `endpoint`),
+  `amd_shape_requests_total`, `amd_debug_captures_total`,
+  `amd_websocket_connections_opened_total`. **Every label combination is
+  materialized at startup** so a series reads `0` from the first scrape rather than
+  popping into existence on its first event.
+- **Gauges** — the current state of the world, which can't be "incremented": sources
+  by state (`amd_sources{state}`), hot/loading/static-loaded counts, `amd_vehicles`,
+  `amd_late_trips`, `amd_scheduled_trips`, archive size, the leaderboard's top and
+  threshold delay, live websocket subscribers, and the memory figures
+  (`amd_process_resident_memory_bytes`, `amd_sqlite_memory_bytes`). These are **not**
+  mirror-updated on every state change — `Scheduler::gauge_values` takes one cheap
+  snapshot of the shared state at **scrape time**, `Metrics::render` writes it into
+  the gauge handles, and the registry is encoded. A gauge is therefore always at most
+  one scrape stale and never drifts. `gauge_values` counts sources directly rather
+  than reusing `status_report`, whose `no_realtime` trim would undercount them.
+
+Following the same **"expose the timestamp, derive the age"** rule the wire protocol
+uses (an age would change every scrape, defeating nothing here but staying honest),
+health is published as `amd_last_successful_poll_timestamp_seconds` and uptime via
+`amd_start_timestamp_seconds` — Prometheus derives freshness/uptime with `time() -`
+the timestamp. `Metrics` lives behind an `Arc` on the `Scheduler`; its counter/gauge
+handles are internally reference-counted, so the hot paths and handlers hold cheap
+clones writing the same atomics. Adding a metric is a handle on the struct, a
+`register` call in `Metrics::new`, and either a `record_*` call at the event
+(counter) or a field on `GaugeValues` filled in `gauge_values` (gauge).
+
 ### The API layer + frontend (`api.rs`, `../static/`)
 
-A thin axum server over the shared `Arc<Scheduler>`. No pages, five data endpoints:
+A thin axum server over the shared `Arc<Scheduler>`. No pages, five data endpoints
+(plus `/healthz` and `/metrics` for ops — see the metrics section):
 
 - `GET /api/status` — the **full** `StatusReport` (per-source health: fetch
   frequency, success/failure, vehicles now, `total_trips` scale metric,
@@ -331,6 +486,10 @@ A thin axum server over the shared `Arc<Scheduler>`. No pages, five data endpoin
   `{slug, trip_id, message}`; zips up everything behind one leaderboard entry into
   `./debug/` and returns `{ok, path, error}`. Errors (debug off, unknown slug)
   come back in the JSON body, not as an HTTP error, so the page shows them inline.
+- `GET /metrics` — the Prometheus/OpenMetrics scrape (`metrics.rs`). Counters are
+  read from the registry as-is; the gauges are snapshotted from the scheduler's live
+  state at scrape time. Also `GET /healthz` — 200/503 liveness from
+  `Scheduler::health` (the poll loop is turning), cheap enough to poll often.
 
 The two HTML pages are plain vanilla-JS, no build step. The leaderboard page renders
 the merged board as three stacked sections — the **#1 row**, a **Leaflet map** of one
@@ -349,16 +508,37 @@ up *while we watched* — from the snapshot's `tracked_seconds` / `birth_delay_s
 (see the delay-provenance section). These are receipts, not a caveat: everything on
 the board has already passed the vetting gate.
 
+A row whose trip has **finished running** carries `ended_at` and renders dimmed and
+italic (`tr.finished`), with "finished 14m ago" in place of a next stop and the map
+caption saying "last seen at" rather than "vehicle at" — its position is frozen at
+the final sighting, not where the bus is now. `ended_at` is a **unix timestamp, not
+an age**, for exactly the reason `SourceStatus.last_poll` is (see `wire.rs`); the page
+derives the age against the message's own `generated_at`, which also keeps a skewed
+browser clock from rendering "finished -3m ago". The **Late** column shows
+`peak_delay_seconds`, so the number on screen is the one the row was ranked on.
+
 **Debug mode** (`AMD_DEBUG` env var — any value but empty/`0`/`false`/`no`; a
 runtime flag, not a build flag, so it costs a single bool check when off and no
-work until a capture is triggered) surfaces a per-row 🐛 **capture** column on the
-leaderboard page. The snapshot carries `debug_enabled` so the frontend reveals the
+work until a capture is triggered) surfaces two per-row columns on the leaderboard
+page: 🧮 **score** and 🐛 **capture**.
+
+🧮 opens a dialog showing how the row's rank was computed — every factor with its
+value and the inputs that produced it (`score_breakdown`, built by
+`ScoreInputs::breakdown`). It's the audit trail for a ranking that is otherwise
+deliberately hidden. The field is `skip_serializing_if = "Option::is_none"` and only
+populated when debug is on, which is **not** cosmetic: it carries the decay factor,
+which changes every tick for every finished row, so shipping it in production would
+drag the whole board onto the wire each tick and undo `wire.rs` (measured: 25.7 KB
+per delta with it, 4.0 KB without). The snapshot carries `debug_enabled` so the frontend reveals the
 column (CSS `body.debug-on`). Clicking prompts for a free-text note and POSTs to
 `/api/debug/capture`; `Scheduler::capture_debug` **over-collects** (deliberately —
 this is a developer tool, never user-facing) into a zip: the agency config +
 per-source health, the **live re-fetched** trip-updates and vehicle-positions
 feeds (raw `.pb` bytes *and* a decoded pretty-print, plus the just-this-trip
-subset), the recomputed `DelayedTrip` + leaderboard entry, the trip's static
+subset), the recomputed `DelayedTrip` + leaderboard entry, the archive record behind
+the row (`leaderboard_record` — its lifecycle timestamps, cached static span, and the
+full score arithmetic, which is the first thing to look at when the question is "why
+is this ranked here" or "why is this still on the board"), the trip's static
 schedule rows (`Gtfs::debug_dump`), and a verbatim copy of the cached static GTFS
 zip **and** SQLite index. The realtime feeds are re-fetched *at capture time* so
 the archive reflects the feed state when the anomaly is visible, not whenever the
@@ -468,6 +648,23 @@ snapshot, and the leaderboard's **Watched** column shows them; `/status` shows
   `sqlite_bytes` / `sqlite_peak_bytes` / `process_rss_bytes` so this stays checkable
   instead of guessed at.
 
+  **The allocator gives memory back — glibc didn't.** The heap above is bounded, but
+  RSS wasn't: a cold start (download + import hundreds of feeds) sat at ~500 MB
+  indefinitely while a warm restart (caches on disk, imports skipped) sat at ~200 MB,
+  both flat for hours. That gap is *retained peak transient allocation*, not a leak —
+  glibc's malloc scatters freed buffers across up to 8×ncpus arenas (128 on a 16-core
+  box) and effectively never `madvise`s them back, so the process homesteads its
+  cold-start high-water mark, and every 24h maintenance re-import ratchets it back up.
+  The fix is the global allocator: `main.rs` sets **jemalloc** (`tikv-jemallocator`)
+  with a compiled-in `_rjem_malloc_conf` of `background_thread:true` +
+  `dirty_decay_ms`/`muzzy_decay_ms` of 5s, so a background thread purges dirty pages to
+  the OS seconds after a burst frees them. This is what makes RSS *fall back* after
+  warmup/maintenance instead of pinning at the peak — the property an indefinitely
+  running process needs. (The symbol is `_rjem_malloc_conf`, not `malloc_conf`: tikv
+  prefixes every jemalloc symbol with `_rjem_`; the env override is `_RJEM_MALLOC_CONF`.
+  `#[used]` keeps the static from being stripped before it can override jemalloc's weak
+  default.)
+
   Things that sound good here and **aren't**: consolidating the per-feed databases
   into one file (either a table per feed, or one table with a `dataset_id`) — a
   per-feed table explodes the schema every connection must parse, and a shared table
@@ -505,11 +702,24 @@ snapshot, and the leaderboard's **Watched** column shows them; `/status` shows
   Don't "simplify" either check away; a truthful HTTP status is not something these
   feeds reliably provide.
 
+  `trip_span` is one indexed pass giving a trip's scheduled running time, stop count,
+  and stops still ahead of a given sequence — the scale `score.rs` judges a delay
+  against. It's static data, so the scheduler looks it up **once per trip, ever** and
+  caches it on the `TripRecord` (`span_checked` distinguishes "the agency's static
+  isn't loaded yet, retry" from "the schedule doesn't know this trip", so we neither
+  retry forever nor give up before the static arrives).
   `count_trips` counts a schedule's trips straight from the zip without building the
   index (for the census). `is_stale` is the shared freshness check. A static URL
   with a `#inner.zip` fragment (a GTFS zip nested inside another zip — e.g. SEPTA's
   `gtfs_public.zip#google_bus.zip`) is **unwrapped at download time** so the cache
-  always holds a flat GTFS zip.
+  always holds a flat GTFS zip. `Gtfs::load` takes a **slice of static URLs** (almost
+  always one): a feed with `extra_static_urls` (MTA Bus's five boroughs) downloads
+  each to its own cache file (`<slug>.zip`, `<slug>.staticN.zip`) and **merges them
+  all into one SQLite index** in a single import transaction — the ids across those
+  zips are disjoint, so nothing collides. The index rebuilds when *any* backing zip
+  is newer, and maintenance treats the feed as stale if any one has aged out;
+  `count_trips` sums the per-zip counts. This is the general fix for one realtime
+  stream backed by several separately-published static zips.
 - `delay.rs`: turns a realtime feed into a `FeedDelays` — the late `DelayedTrip`s
   (fully labelled, leaderboard candidates) **plus a `TripObservation` for every trip
   it could time at all**, late or not, which is what `history.rs` needs (see above;
@@ -583,7 +793,18 @@ snapshot, and the leaderboard's **Watched** column shows them; `/status` shows
   loosening the birth rule — a board that fills instantly after a restart is a board
   that trusts delays it has no evidence for, which is precisely how the MARTA and
   LADOT fakes got to #1. If you need a populated board immediately (a demo), let it
-  warm up rather than raising the constants.
+  warm up rather than raising the constants. The 24h archive is **in-memory only** and
+  dies with the process, so a restart also discards every finished trip — the decaying
+  tail rebuilds over the following day. Persisting it is a real feature, not a bug
+  fix, and would need the provenance receipts persisted alongside or the reloaded
+  entries would be unauditable.
+- **A field that changes every tick is still the pathological case, and the score is
+  one.** It decays continuously for every finished row, so it is deliberately never
+  serialized in production — the board conveys its ranking through array order and
+  `rank`, not a number. The same reasoning forbids sending an "age since ended", a
+  "time left before it decays off", or a live score to the page: send the timestamp
+  and derive the rest client-side. If you add a factor to the score, putting it in the
+  *payload* is a separate decision with a recurring egress cost.
 - The ceilings in `delay.rs` (`MAX_PLAUSIBLE_DELAY`, `MAX_INFERRED_DELAY`), the
   terminal-stop rule, and the `STALE_PREDICTION_SECS` ghost check are now **backstops
   behind** the provenance gate, not the primary defense — they were each added to

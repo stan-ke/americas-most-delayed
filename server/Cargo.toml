@@ -36,3 +36,7 @@ tower-http = { version = "0.7.0", features = [
     "compression-gzip",
     "cors",
 ] }
+prometheus-client = "0.25.0"
+
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = "0.6"

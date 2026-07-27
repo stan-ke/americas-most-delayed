@@ -460,6 +460,7 @@ fn build_config(
         slug,
         display_name,
         static_url,
+        extra_static_urls: Vec::new(),
         realtime_urls: GtfsRtUrls {
             trip_updates_url,
             vehicle_positions_url,

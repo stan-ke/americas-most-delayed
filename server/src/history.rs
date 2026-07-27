@@ -159,7 +159,13 @@ impl TripHistory {
     }
 
     /// Record one poll's observations for a source, then drop from `trips` every
-    /// trip whose delay we can't vouch for. Returns how many were dropped.
+    /// trip whose delay we can't vouch for. Returns the ids that were refused.
+    ///
+    /// The caller needs the *ids*, not just a count: a trip that has already been
+    /// archived for the leaderboard and only now turns out to be a stale label must
+    /// be evicted from that archive too, or it would linger there as a "finished"
+    /// trip and decay across the wall of shame for a day (see
+    /// [`crate::score`]). Refusing it here is the only moment we learn that.
     ///
     /// `observations` must cover **every** trip the feed published a delay for, late
     /// or not — an on-time sighting is exactly the evidence that lets the same trip
@@ -170,7 +176,7 @@ impl TripHistory {
         observations: &[TripObservation],
         trips: &mut Vec<DelayedTrip>,
         now: i64,
-    ) -> usize {
+    ) -> Vec<String> {
         let mut sources = self.sources.lock().unwrap();
         let tracks = sources.entry(idx).or_default();
 
@@ -190,13 +196,17 @@ impl TripHistory {
             }
         }
 
-        let before = trips.len();
+        let mut refused = Vec::new();
         trips.retain(|trip| {
-            tracks
+            let credible = tracks
                 .get(&trip.trip_id)
-                .is_some_and(|track| track.credible)
+                .is_some_and(|track| track.credible);
+            if !credible {
+                refused.push(trip.trip_id.clone());
+            }
+            credible
         });
-        before - trips.len()
+        refused
     }
 
     /// The evidence behind one credited trip's delay, if we're still tracking it.

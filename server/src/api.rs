@@ -40,11 +40,25 @@ use tower_http::{
     cors::{Any, CorsLayer},
 };
 
+use crate::metrics;
 use crate::scheduler::Scheduler;
 use crate::wire::encode_polyline;
 
-/// Port the API listens on.
-const PORT: u16 = 8080;
+/// Default port the API listens on, when `PORT` isn't set in the environment.
+const DEFAULT_PORT: u16 = 8080;
+
+/// Port the API listens on: the `PORT` env var if it parses as a `u16`, else
+/// [`DEFAULT_PORT`]. A malformed value falls back to the default (logged) rather
+/// than aborting startup.
+fn port() -> u16 {
+    match std::env::var("PORT") {
+        Ok(raw) => raw.parse().unwrap_or_else(|_| {
+            eprintln!("Ignoring malformed PORT={raw:?}, using {DEFAULT_PORT}");
+            DEFAULT_PORT
+        }),
+        Err(_) => DEFAULT_PORT,
+    }
+}
 
 /// How long a browser may reuse a route shape. A trip's path doesn't change within
 /// a service day, and the static schedule behind it is only refreshed every 24h —
@@ -65,6 +79,7 @@ pub async fn serve(scheduler: Shared) -> Result<()> {
 
     let app = Router::new()
         .route("/healthz", get(healthz))
+        .route("/metrics", get(metrics))
         .route("/api/status", get(status))
         .route("/api/status/live", get(status_live))
         .route("/api/shape/{slug}/{trip_id}", get(shape))
@@ -74,7 +89,7 @@ pub async fn serve(scheduler: Shared) -> Result<()> {
         .layer(cors)
         .with_state(scheduler);
 
-    let listener = tokio::net::TcpListener::bind(("0.0.0.0", PORT)).await?;
+    let listener = tokio::net::TcpListener::bind(("0.0.0.0", port())).await?;
     println!("Serving the API on http://{}", listener.local_addr()?);
 
     axum::serve(listener, app).await?;
@@ -89,6 +104,7 @@ pub async fn serve(scheduler: Shared) -> Result<()> {
 /// See [`Scheduler::health`] for what "healthy" means and why it's cheap enough to
 /// poll often.
 async fn healthz(State(scheduler): State<Shared>) -> Response {
+    scheduler.metrics().record_http("healthz");
     let health = scheduler.health();
     let code = if health.ok {
         StatusCode::OK
@@ -96,6 +112,25 @@ async fn healthz(State(scheduler): State<Shared>) -> Response {
         StatusCode::SERVICE_UNAVAILABLE
     };
     (code, Json(health)).into_response()
+}
+
+/// `GET /metrics`: the Prometheus/OpenMetrics scrape (see [`crate::metrics`]).
+///
+/// Cumulative counters live in the registry and are read as-is; the gauge-style
+/// metrics are snapshotted from the scheduler's live state right here, at scrape
+/// time, so they're always fresh without any per-tick bookkeeping.
+async fn metrics(State(scheduler): State<Shared>) -> Response {
+    scheduler.metrics().record_http("metrics");
+    let body = scheduler.metrics().render(&scheduler.gauge_values());
+    (
+        StatusCode::OK,
+        [(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static(metrics::CONTENT_TYPE),
+        )],
+        body,
+    )
+        .into_response()
 }
 
 /// `GET /api/status`: the whole source-health report, `seq` included.
@@ -107,6 +142,7 @@ async fn healthz(State(scheduler): State<Shared>) -> Response {
 /// Already serialized by the delta stream — handing back the string keeps this a
 /// zero-work read of shared state.
 async fn status(State(scheduler): State<Shared>) -> Response {
+    scheduler.metrics().record_http("status");
     json_response(scheduler.status_full())
 }
 
@@ -120,10 +156,12 @@ async fn shape(
     State(scheduler): State<Shared>,
     Path((slug, trip_id)): Path<(String, String)>,
 ) -> Response {
+    scheduler.metrics().record_http("shape");
     let points = scheduler
         .trip_shape(&slug, &trip_id)
         .await
         .unwrap_or_default();
+    scheduler.metrics().record_shape(!points.is_empty());
 
     // Never cache an empty answer: "static isn't loaded yet" is a passing state, and
     // caching it for a day would leave the map blank long after the shape exists.
@@ -174,20 +212,27 @@ async fn debug_capture(
     State(scheduler): State<Shared>,
     Json(request): Json<CaptureRequest>,
 ) -> Json<CaptureResponse> {
+    scheduler.metrics().record_http("debug_capture");
     match scheduler
         .capture_debug(&request.slug, &request.trip_id, &request.message)
         .await
     {
-        Ok(path) => Json(CaptureResponse {
-            ok: true,
-            path: Some(path),
-            error: None,
-        }),
-        Err(error) => Json(CaptureResponse {
-            ok: false,
-            path: None,
-            error: Some(format!("{error:#}")),
-        }),
+        Ok(path) => {
+            scheduler.metrics().record_debug_capture(true);
+            Json(CaptureResponse {
+                ok: true,
+                path: Some(path),
+                error: None,
+            })
+        }
+        Err(error) => {
+            scheduler.metrics().record_debug_capture(false);
+            Json(CaptureResponse {
+                ok: false,
+                path: None,
+                error: Some(format!("{error:#}")),
+            })
+        }
     }
 }
 
@@ -197,6 +242,8 @@ async fn subscribe(
     State(scheduler): State<Shared>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    scheduler.metrics().record_http("subscribe");
+    scheduler.metrics().record_ws_open("leaderboard");
     upgrade.on_upgrade(move |socket| {
         // Subscribe *before* building the full, so no delta that lands in between is
         // lost. A delta the client already has is harmless — its `seq` is not ahead
@@ -213,6 +260,8 @@ async fn status_live(
     State(scheduler): State<Shared>,
     upgrade: WebSocketUpgrade,
 ) -> impl IntoResponse {
+    scheduler.metrics().record_http("status_live");
+    scheduler.metrics().record_ws_open("status");
     upgrade.on_upgrade(move |socket| {
         let updates = scheduler.subscribe_status();
         stream(socket, updates, String::new())

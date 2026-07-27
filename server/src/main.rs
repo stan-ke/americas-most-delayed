@@ -7,8 +7,10 @@ mod catalogs;
 mod delay;
 mod gtfs;
 mod history;
+mod metrics;
 mod realtime;
 mod scheduler;
+mod score;
 mod wire;
 
 use std::collections::HashSet;
@@ -21,6 +23,36 @@ use crate::auth::FeedAuth;
 use crate::catalogs::catalog::GtfsCatalogProvider;
 use crate::catalogs::mobilitydata::MobilityDataProvider;
 use crate::catalogs::transitland::TransitlandProvider;
+
+// jemalloc as the global allocator, so the process actually gives memory back.
+//
+// This server allocates in bursts: a cold start downloads and imports hundreds of
+// GTFS feeds, and the maintenance task re-imports stale ones every 24h. Under glibc
+// malloc those bursts pinned RSS at their peak forever — freed buffers scattered
+// across up to 8×ncpus arenas that glibc never `madvise`s back to the OS, so a
+// cold start sat at ~500 MB indefinitely while a warm restart (which skips the
+// downloads/imports) sat at ~200 MB. jemalloc bounds the arena count and reclaims;
+// see the `malloc_conf` below.
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+// Turn on jemalloc's background purge thread and give dirty/muzzy pages a short
+// decay window, so the memory freed after a warmup or maintenance burst is returned
+// to the OS within seconds instead of being held for the life of the process. This
+// is what keeps RSS flat across an indefinite run rather than ratcheting up to the
+// cold-start high-water mark.
+//
+// The symbol jemalloc reads is `_rjem_malloc_conf`, not `malloc_conf`: tikv's build
+// prefixes every jemalloc symbol with `_rjem_` (its env override is likewise
+// `_RJEM_MALLOC_CONF`). `#[used]` keeps this otherwise-unreferenced static from being
+// stripped before it can override jemalloc's own weak default; `export_name` is
+// `unsafe` in edition 2024.
+#[cfg(not(target_env = "msvc"))]
+#[used]
+#[allow(non_upper_case_globals)]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+pub static malloc_conf: &[u8] = b"background_thread:true,dirty_decay_ms:5000,muzzy_decay_ms:5000\0";
 
 /// Catalog sources to draw agencies from, **in order of preference** — an earlier
 /// source wins any collision (same slug or same realtime feed) against a later
@@ -83,9 +115,9 @@ async fn main() -> Result<()> {
 async fn collect_agencies(auth: &FeedAuth) -> Result<Vec<AgencyConfig>> {
     // NJ Transit and the other hand-configured feeds go first, so they win dedup
     // over the catalogs' `requires_auth` / `no_realtime` versions of the same
-    // agency (see `agency::authed_agencies`).
+    // agency (see `auth::FeedAuth::authed_agencies`, driven by `auth.json`).
     let mut configs = vec![agency::nj_transit()];
-    configs.extend(agency::authed_agencies(auth));
+    configs.extend(auth.authed_agencies());
     for &source in CATALOG_SOURCES {
         match source.load().await {
             Ok(agencies) => {

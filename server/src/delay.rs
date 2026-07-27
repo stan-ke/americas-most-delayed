@@ -43,6 +43,11 @@ pub struct DelayedTrip {
     pub next_stop: Option<String>,
     /// Rider-facing vehicle identity: label (bus number), then license plate.
     pub vehicle: Option<String>,
+    /// Sequence of the stop the delay was read at — where the vehicle is *now*.
+    /// Carried through so the leaderboard score can ask the static schedule how many
+    /// stops are still ahead of it (see [`crate::score`]); `None` for a feed that
+    /// publishes no stop sequence.
+    pub stop_sequence: Option<u32>,
 }
 
 /// One trip's delay as measured on a single poll — late, early, or on time.
@@ -268,6 +273,7 @@ fn describe(
         headsign,
         next_stop,
         vehicle,
+        stop_sequence: measurement.stop_sequence,
     }
 }
 

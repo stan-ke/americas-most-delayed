@@ -36,7 +36,9 @@ use crate::auth::FeedAuth;
 use crate::delay::{self, DelayedTrip, TripObservation, VehiclePositions};
 use crate::gtfs::{self, Gtfs};
 use crate::history::TripHistory;
+use crate::metrics::{GaugeValues, Metrics};
 use crate::realtime;
+use crate::score::{self, ScoreBreakdown, ScoreInputs};
 use crate::wire::DeltaStream;
 
 /// Ring-buffer capacity for the live-update broadcast. A websocket client that
@@ -93,6 +95,27 @@ const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
 /// leaderboard. Generous, to catch gross mismatches — a vehicle in the wrong city —
 /// not the normal GPS / shape-simplification wobble of a few hundred metres.
 const OFF_ROUTE_KM: f64 = 2.0;
+/// How long a ranked trip may go unmentioned by its feed before we call it
+/// **finished** and start its decay clock (see [`crate::score`]). Comfortably longer
+/// than [`MAX_INTERVAL`], so an ordinary gap between two polls of a backed-off feed
+/// never retires a live trip — and in practice a trip near the board keeps its feed
+/// hot at [`BASE_INTERVAL`], so the end of a run is noticed within seconds of it
+/// actually happening. The decay clock is set to the trip's *last sighting*, not to
+/// when we noticed, so a slow feed doesn't win its trips extra time on the wall.
+const TRIP_END_GRACE: u64 = 10 * 60;
+/// Ceiling on how many finished trips we keep around to decay. The 24h horizon alone
+/// would bound this, but loosely: this caps the archive at the only ones that could
+/// still plausibly rank, so memory doesn't scale with a day of every agency's late
+/// trips. Kept well above [`LEADERBOARD_SIZE`] so the board never runs dry as
+/// entries decay out.
+const ARCHIVE_CAP: usize = 400;
+/// How close a delayed trip's live vehicle must sit to either end of its route shape
+/// (its start or final terminal) before we drop it from the leaderboard — it's a
+/// vehicle parked at a terminal, not one late en route, and its reported delay is
+/// spurious (a run that hasn't departed, or a finished run going stale). Kept small
+/// so a bus genuinely crawling near either endpoint isn't suppressed; the trip stays
+/// *watched* (its history keeps accruing), it's only held off the ranked board.
+const TERMINAL_KM: f64 = 0.4;
 
 /// One entry on the public leaderboard — a single late trip, ranked globally.
 #[derive(Debug, Clone, Serialize)]
@@ -110,6 +133,19 @@ pub struct LeaderboardEntry {
     pub next_stop: Option<String>,
     pub vehicle: Option<String>,
     pub delay_seconds: i64,
+    /// The worst this trip ever got while we could vouch for it — what it's ranked
+    /// on, and what a finished trip is remembered for rather than whatever its last
+    /// frame happened to say. Equal to `delay_seconds` for almost every live trip.
+    pub peak_delay_seconds: i64,
+    /// When the trip stopped being reported, as a unix timestamp — `null` while it's
+    /// still running. A finished trip keeps its place and fades out over the next 24
+    /// hours (see [`crate::score`]); the page turns this into "finished 12m ago".
+    ///
+    /// A timestamp rather than an age, for the same reason as
+    /// [`SourceStatus::last_poll`]: an age would change every tick for every ended
+    /// row and drag them all onto the wire (see [`crate::wire`]). This changes once,
+    /// ever, per trip.
+    pub ended_at: Option<u64>,
     /// How the delay was derived: `trip-level`, `stop-level`, or `vs-schedule`.
     pub source: &'static str,
     /// How long we've been watching this trip, and how late it was when we first
@@ -123,6 +159,13 @@ pub struct LeaderboardEntry {
     /// leaderboard page uses it for the most-delayed vehicle.
     pub latitude: Option<f64>,
     pub longitude: Option<f64>,
+    /// The arithmetic behind this row's rank, **debug mode only** — the payload
+    /// behind the leaderboard's 🧮 button. Omitted entirely (not null) when
+    /// `AMD_DEBUG` is off, so it costs nothing in production: it carries the decay
+    /// factor, which changes every tick and would otherwise drag every finished row
+    /// onto the wire (see [`crate::wire`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub score_breakdown: Option<ScoreBreakdown>,
 }
 
 /// The whole leaderboard at one instant — the websocket payload, pushed on
@@ -303,6 +346,72 @@ pub struct StatusReport {
     pub sources: Vec<SourceStatus>,
 }
 
+/// One trip's standing on the wall of shame, from the first poll that ranked it
+/// until it decays off — **including after it has finished running**.
+///
+/// This is the restructure the scored leaderboard needed. The old board could only
+/// ever show what a feed was reporting *right now*, so the worst trip of the day
+/// disappeared the moment it finally pulled in. A record outlives its trip: once the
+/// feed stops mentioning it, [`Scheduler::sweep_archive`] stamps `ended_at` and the
+/// score decays from there (see [`crate::score`]).
+///
+/// So every field a finished entry still needs is **frozen into the record** rather
+/// than looked up at render time — the position, the provenance receipts, the static
+/// span. By the time a record is being displayed hours after it ended, the live
+/// positions map has moved on and [`TripHistory`] has long forgotten the trip.
+struct TripRecord {
+    /// The trip as of its last sighting: route, headsign, next stop, vehicle, delay.
+    trip: DelayedTrip,
+    /// The worst vetted delay this trip ever reached — what it's scored on. The
+    /// growth bound in [`crate::history`] means this tracks the current delay closely
+    /// while live; it matters for a finished trip, whose final frame may be a
+    /// revised-down estimate that isn't what the run should be remembered for.
+    peak_delay_seconds: i64,
+    /// First and most recent poll that ranked this trip.
+    first_seen: u64,
+    last_seen: u64,
+    /// When the trip stopped running — `None` while it's still being reported. Set
+    /// to the *last sighting*, so the decay clock reflects when the trip actually
+    /// ended rather than when we got around to noticing.
+    ended_at: Option<u64>,
+    /// What the timetable plans for this trip, looked up once and cached: it's static
+    /// data, and re-querying it every poll for every ranked trip would be pure waste.
+    span: Option<gtfs::TripSpan>,
+    /// Whether we've *tried* the span lookup with a loaded schedule. Distinguishes
+    /// "this agency's static isn't loaded yet, try again next poll" from "the
+    /// schedule doesn't know this trip", so we neither retry forever nor give up
+    /// before the static arrives.
+    span_checked: bool,
+    /// The provenance receipts as of the last sighting, frozen so a finished trip
+    /// keeps them after [`TripHistory`] has forgotten it.
+    tracked_seconds: u64,
+    birth_delay_seconds: i64,
+    /// Where the vehicle was when we last placed it — for a finished trip, where it
+    /// ended up.
+    latitude: Option<f64>,
+    longitude: Option<f64>,
+}
+
+impl TripRecord {
+    /// Everything [`crate::score`] needs, gathered from the record. `now` is only
+    /// used to age a finished trip; a live one scores the same whenever it's asked.
+    fn score_inputs(&self, now: u64) -> ScoreInputs {
+        ScoreInputs {
+            delay_seconds: self.peak_delay_seconds,
+            scheduled_duration_seconds: self.span.and_then(|s| s.duration_seconds),
+            stops_remaining: self.span.and_then(|s| s.stops_remaining),
+            tracked_seconds: self.tracked_seconds,
+            birth_delay_seconds: self.birth_delay_seconds,
+            has_live_location: self.latitude.is_some() && self.longitude.is_some(),
+            seconds_since_end: self.ended_at.map(|ended| now.saturating_sub(ended) as i64),
+        }
+    }
+
+    fn score(&self, now: u64) -> f64 {
+        self.score_inputs(now).score()
+    }
+}
+
 /// A successful poll: the delayed trips plus how many vehicles the feed carried,
 /// an observation of every trip for the delay history, and whether it's a
 /// times-only feed that needs its static schedule loaded to surface any delay at
@@ -323,8 +432,16 @@ pub struct Scheduler {
     auth: Arc<FeedAuth>,
     /// Caps how many feed fetches are in flight at once.
     limiter: Semaphore,
-    /// Latest delayed trips per agency index; the leaderboard is derived from it.
+    /// Latest delayed trips per agency index — the **live** working set, replaced
+    /// wholesale on every poll and pruned by the off-route check. It's what a poll
+    /// produces; the leaderboard is no longer derived from it directly.
     boards: Mutex<HashMap<usize, Vec<DelayedTrip>>>,
+    /// Every trip that has ranked recently, live or finished, per agency index —
+    /// **this is what the leaderboard is built from**. Each poll folds its board in
+    /// here ([`record_board`](Self::record_board)); trips the feed stops mentioning
+    /// are stamped finished and decay out over 24h
+    /// ([`sweep_archive`](Self::sweep_archive)). See [`TripRecord`].
+    archive: Mutex<HashMap<usize, HashMap<String, TripRecord>>>,
     /// Latest live vehicle coordinates per agency index, keyed by `trip_id`.
     /// Populated only for hot feeds (whose vehicle-positions feed we fetch), and
     /// joined onto leaderboard entries so the map can show the delayed vehicle.
@@ -348,6 +465,10 @@ pub struct Scheduler {
     /// the one the delta protocol exists for.
     source_status: Mutex<DeltaStream>,
     status_updates: broadcast::Sender<Arc<str>>,
+    /// Prometheus metrics for the whole pipeline (served at `/metrics`). Counters
+    /// are bumped from the hot paths below; gauges are snapshotted at scrape time
+    /// from [`gauge_values`](Self::gauge_values). See [`crate::metrics`].
+    metrics: Arc<Metrics>,
     /// Whether debug capture (`AMD_DEBUG`) is on. Gates [`capture_debug`](Self::capture_debug)
     /// and is surfaced to the frontend via each snapshot's `debug_enabled`.
     debug: bool,
@@ -382,6 +503,7 @@ impl Scheduler {
             auth,
             limiter: Semaphore::new(MAX_CONCURRENT_POLLS),
             boards: Mutex::new(HashMap::new()),
+            archive: Mutex::new(HashMap::new()),
             positions: Mutex::new(HashMap::new()),
             static_gtfs: Mutex::new(HashMap::new()),
             status: Mutex::new(status),
@@ -393,6 +515,7 @@ impl Scheduler {
             updates,
             source_status: Mutex::new(DeltaStream::new("sources", &["slug"], false)),
             status_updates,
+            metrics: Arc::new(Metrics::new(debug, unix_now())),
             debug,
         }
     }
@@ -440,11 +563,18 @@ impl Scheduler {
                 // hands us a stale `trip_id` — a bus finished one run and sent out
                 // on a later one, still wearing the old label — reads as hours late
                 // and tops the board (see [`crate::history`]).
-                let vetted_out =
-                    self.history
-                        .vet(idx, &observations, &mut trips, unix_now() as i64);
-                self.record_success(idx, vehicle_count, trips.len(), vetted_out);
+                let refused = self
+                    .history
+                    .vet(idx, &observations, &mut trips, unix_now() as i64);
+                self.record_success(idx, vehicle_count, trips.len(), refused.len());
                 self.boards.lock().unwrap().insert(idx, trips);
+                // A trip the history has just falsified may already be archived from
+                // an earlier poll, back when we still believed it. Evict it: left
+                // alone it would simply stop being refreshed, get stamped "finished",
+                // and spend a day decaying across the wall of shame on a delay we now
+                // know was a stale label.
+                let evicted = self.evict_archived(idx, &refused);
+                self.metrics.record_evicted("falsified", evicted as u64);
                 // A times-only feed (no delay fields, just predicted times) surfaced
                 // nothing: load its static schedule so the next poll can derive
                 // delays by comparison. Without this it could never appear — it
@@ -472,17 +602,26 @@ impl Scheduler {
             }
         }
 
-        // Is this feed hot (a vehicle in the global top N)? That both keeps it on
-        // the fast interval and earns it a static-feed load for richer labels —
-        // and its live vehicle positions, so the map can show the delayed vehicle.
-        // Fetching positions also prunes off-route trips from the board, so we
-        // recompute hotness afterward: a feed whose only delayed trips were bogus
-        // drops out of the top N and backs off.
-        if leaderboard_contains(&self.boards.lock().unwrap(), idx) {
+        // Fold this poll's board into the archive *before* asking whether the feed is
+        // hot: the archive is what the leaderboard ranks, so a trip that isn't in it
+        // yet can't be seen to be winning. Hotness must be judged on score, not raw
+        // delay — the two no longer agree, and a short trip that scores its way onto
+        // the board would otherwise never earn the positions fetch that verifies it.
+        self.record_board(idx).await;
+
+        // Is this feed hot (a trip in the global top N)? That keeps it on the fast
+        // interval, earns it a static-feed load for richer labels, and fetches its
+        // live vehicle positions so the map can show the delayed vehicle. Fetching
+        // positions also prunes off-route trips, so we record and recheck afterward:
+        // a feed whose only delayed trips were bogus drops out and backs off.
+        if self.on_leaderboard(idx) {
             self.ensure_static_loaded(idx).await;
             self.update_vehicle_positions(idx).await;
+            // Again, now that the pruning has happened and the static schedule may
+            // have arrived — this is what attaches positions and trip spans.
+            self.record_board(idx).await;
         }
-        let hot = leaderboard_contains(&self.boards.lock().unwrap(), idx);
+        let hot = self.on_leaderboard(idx);
         let next_interval = if hot {
             BASE_INTERVAL
         } else {
@@ -493,6 +632,228 @@ impl Scheduler {
         status[idx].hot = hot;
         status[idx].interval = next_interval;
         Some(next_interval)
+    }
+
+    /// Fold a feed's current live board into the [`archive`](Self::archive) — the
+    /// set the leaderboard actually ranks.
+    ///
+    /// Upsert, never replace: a trip already on record keeps its identity (and its
+    /// peak, its birth, its first sighting) and simply gets refreshed. A trip that is
+    /// still being reported is by definition not finished, so this also *clears* any
+    /// `ended_at` — that's how a feed which skipped a beat, or a vehicle that pulled
+    /// away from a terminal layover and is genuinely late again, gets its place back
+    /// instead of decaying while still running.
+    ///
+    /// Idempotent, because [`poll_once`](Self::poll_once) calls it twice: once before
+    /// deciding the feed is hot, and again after the vehicle-position fetch has
+    /// pruned the board and possibly loaded the static schedule.
+    async fn record_board(&self, idx: usize) {
+        let live: Vec<DelayedTrip> = self
+            .boards
+            .lock()
+            .unwrap()
+            .get(&idx)
+            .cloned()
+            .unwrap_or_default();
+        if live.is_empty() {
+            return;
+        }
+
+        // The static span is looked up **once per trip, ever** — it's timetable data
+        // that can't change under us, and re-querying it every poll for every ranked
+        // trip would be pure waste. `span_checked` is what stops us both from
+        // retrying forever and from giving up before the agency's static arrives.
+        let pending: Vec<(String, Option<u32>)> = {
+            let archive = self.archive.lock().unwrap();
+            let known = archive.get(&idx);
+            live.iter()
+                .filter(|trip| {
+                    known
+                        .and_then(|records| records.get(&trip.trip_id))
+                        .is_none_or(|record| !record.span_checked)
+                })
+                .map(|trip| (trip.trip_id.clone(), trip.stop_sequence))
+                .collect()
+        };
+        let spans: HashMap<String, Option<gtfs::TripSpan>> = match self.loaded_static(idx) {
+            Some(gtfs) if !pending.is_empty() => tokio::task::spawn_blocking(move || {
+                pending
+                    .into_iter()
+                    .map(|(trip_id, sequence)| {
+                        let span = gtfs.trip_span(&trip_id, sequence);
+                        (trip_id, span)
+                    })
+                    .collect()
+            })
+            .await
+            .unwrap_or_default(),
+            // No schedule loaded yet: leave every span unchecked and try again on a
+            // later poll, once this feed has gone hot enough to earn a static load.
+            _ => HashMap::new(),
+        };
+
+        // Both of these are frozen into the record rather than joined at render time,
+        // because a finished trip outlives both sources: the positions map moves on,
+        // and the history forgets the trip after 20 minutes.
+        let coords: Vec<Option<(f64, f64)>> = {
+            let positions = self.positions.lock().unwrap();
+            let feed = positions.get(&idx);
+            live.iter()
+                .map(|trip| feed.and_then(|f| f.get(&trip.trip_id)).copied())
+                .collect()
+        };
+        let receipts: Vec<_> = live
+            .iter()
+            .map(|trip| self.history.provenance(idx, &trip.trip_id))
+            .collect();
+
+        let now = unix_now();
+        let mut archive = self.archive.lock().unwrap();
+        let records = archive.entry(idx).or_default();
+        for ((trip, position), receipt) in live.into_iter().zip(coords).zip(receipts) {
+            let span = spans.get(&trip.trip_id).copied();
+            match records.get_mut(&trip.trip_id) {
+                Some(record) => {
+                    record.peak_delay_seconds = record.peak_delay_seconds.max(trip.delay_seconds);
+                    record.last_seen = now;
+                    record.ended_at = None;
+                    record.trip = trip;
+                    if let Some(span) = span {
+                        record.span = span;
+                        record.span_checked = true;
+                    }
+                    if let Some((lat, lon)) = position {
+                        record.latitude = Some(lat);
+                        record.longitude = Some(lon);
+                    }
+                    if let Some(receipt) = receipt {
+                        record.tracked_seconds = receipt.tracked_seconds;
+                        record.birth_delay_seconds = receipt.birth_delay_seconds;
+                    }
+                }
+                None => {
+                    records.insert(
+                        trip.trip_id.clone(),
+                        TripRecord {
+                            peak_delay_seconds: trip.delay_seconds,
+                            first_seen: now,
+                            last_seen: now,
+                            ended_at: None,
+                            span: span.flatten(),
+                            span_checked: span.is_some(),
+                            tracked_seconds: receipt.map_or(0, |r| r.tracked_seconds),
+                            birth_delay_seconds: receipt.map_or(0, |r| r.birth_delay_seconds),
+                            latitude: position.map(|(lat, _)| lat),
+                            longitude: position.map(|(_, lon)| lon),
+                            trip,
+                        },
+                    );
+                }
+            }
+        }
+    }
+
+    /// Remove trips from a feed's archive outright — for data we've decided never
+    /// described a real run, so it shouldn't linger and decay as though it had.
+    /// Returns how many records were actually removed (a `trip_id` may not have been
+    /// archived yet), for the eviction metric.
+    fn evict_archived(&self, idx: usize, trip_ids: &[String]) -> usize {
+        if trip_ids.is_empty() {
+            return 0;
+        }
+        let mut archive = self.archive.lock().unwrap();
+        if let Some(records) = archive.get_mut(&idx) {
+            let before = records.len();
+            records.retain(|trip_id, _| !trip_ids.contains(trip_id));
+            before - records.len()
+        } else {
+            0
+        }
+    }
+
+    /// Whether agency `idx` currently has a **live** trip in the global top
+    /// [`LEADERBOARD_SIZE`] by score — the signal that keeps a feed on the fast poll
+    /// interval and earns it a static load and a positions fetch.
+    ///
+    /// Deliberately keyed on live trips only: a feed whose sole presence on the board
+    /// is a finished trip decaying out has nothing left worth polling quickly for.
+    /// The trips it competes *against*, though, are all of them — a live trip that a
+    /// day's worth of decaying disasters have pushed off the board isn't hot either.
+    ///
+    /// Same O(n) count-who-beats-me trick as before rather than a sort: take this
+    /// feed's best live score and count how many records anywhere beat it.
+    fn on_leaderboard(&self, idx: usize) -> bool {
+        let now = unix_now();
+        let archive = self.archive.lock().unwrap();
+        let Some(best) = archive.get(&idx).and_then(|records| {
+            records
+                .values()
+                .filter(|record| record.ended_at.is_none())
+                .map(|record| record.score(now))
+                .max_by(f64::total_cmp)
+        }) else {
+            return false;
+        };
+        let ahead = archive
+            .values()
+            .flat_map(|records| records.values())
+            .filter(|record| record.score(now) > best)
+            .count();
+        ahead < LEADERBOARD_SIZE
+    }
+
+    /// Age the archive: retire trips their feeds have stopped reporting, and drop the
+    /// ones that have decayed past being worth keeping. Runs on the leaderboard tick.
+    ///
+    /// Three passes, in order:
+    ///
+    /// 1. **Retire.** A trip unmentioned for [`TRIP_END_GRACE`] has finished running.
+    ///    Its decay clock is stamped at its *last sighting*, not now, so a slow feed
+    ///    doesn't buy its trips extra time on the wall.
+    /// 2. **Expire.** Past [`score::MAX_RETENTION_SECS`] the score is exactly zero, so
+    ///    the record can go. This is the 24-hour horizon: nothing homesteads the wall
+    ///    of shame.
+    /// 3. **Cap.** Keep only the top [`ARCHIVE_CAP`] finished trips. The horizon alone
+    ///    bounds memory, but loosely — at a day of every agency's late trips. This
+    ///    keeps only the ones that could still plausibly rank.
+    fn sweep_archive(&self) {
+        let now = unix_now();
+        let mut finished_by_grace = 0u64;
+        let mut archive = self.archive.lock().unwrap();
+
+        for records in archive.values_mut() {
+            for record in records.values_mut() {
+                if record.ended_at.is_none()
+                    && now.saturating_sub(record.last_seen) > TRIP_END_GRACE
+                {
+                    record.ended_at = Some(record.last_seen);
+                    finished_by_grace += 1;
+                }
+            }
+            records.retain(|_, record| {
+                record.ended_at.is_none_or(|ended| {
+                    (now.saturating_sub(ended) as i64) < score::MAX_RETENTION_SECS
+                })
+            });
+        }
+
+        let mut finished: Vec<f64> = archive
+            .values()
+            .flat_map(|records| records.values())
+            .filter(|record| record.ended_at.is_some())
+            .map(|record| record.score(now))
+            .collect();
+        if finished.len() > ARCHIVE_CAP {
+            finished.sort_unstable_by(|a, b| b.total_cmp(a));
+            let cutoff = finished[ARCHIVE_CAP];
+            for records in archive.values_mut() {
+                records.retain(|_, record| record.ended_at.is_none() || record.score(now) > cutoff);
+            }
+        }
+
+        archive.retain(|_, records| !records.is_empty());
+        drop(archive);
+        self.metrics.record_finished("grace", finished_by_grace);
     }
 
     /// Fetch every trip-updates URL for a feed and compute its delayed trips,
@@ -508,12 +869,33 @@ impl Scheduler {
         let entities = {
             let _permit = self.limiter.acquire().await.expect("semaphore stays open");
             let mut entities = Vec::new();
+            let mut last_err = None;
+            let mut ok = 0usize;
             for url in &config.realtime_urls.trip_updates_url {
-                entities.extend(
-                    realtime::fetch_feed(&self.client, &self.auth, url)
-                        .await?
-                        .entity,
-                );
+                match realtime::fetch_feed(&self.client, &self.auth, url).await {
+                    Ok(feed) => {
+                        entities.extend(feed.entity);
+                        ok += 1;
+                    }
+                    // A feed that merges several sub-feeds (Puget Sound polls one URL
+                    // per OBA agency, MTA subway one per line) must not be sunk by a
+                    // single flaky or auth-gated sub-feed — one `401` would otherwise
+                    // propagate and *retire* the whole source. Log and press on with
+                    // whatever answered; only propagate if *nothing* did, so a truly
+                    // dead single-URL feed still hits the fatal-status retirement.
+                    Err(err) => {
+                        eprintln!(
+                            "[{}] trip updates fetch failed for {url}: {err:#}",
+                            config.display_name
+                        );
+                        last_err = Some(err);
+                    }
+                }
+            }
+            if ok == 0
+                && let Some(err) = last_err
+            {
+                return Err(err);
             }
             entities
         };
@@ -578,11 +960,34 @@ impl Scheduler {
         self.drop_offroute_trips(idx, positions).await;
     }
 
-    /// Drop from a feed's board any ranked trip whose live vehicle is more than
-    /// [`OFF_ROUTE_KM`] from its route shape — a trip/vehicle mismatch we don't want
-    /// on the leaderboard. Only checks trips we have both a position and a shape for;
-    /// anything unverifiable is left in place. The shape lookups + distance math run
-    /// on the blocking pool.
+    /// Drop from a feed's board any ranked trip its live vehicle position shows to be
+    /// bad data, in two ways — both a trip/vehicle mismatch and a stationary vehicle
+    /// out-growing the field:
+    ///
+    /// - **off-route** — the vehicle sits more than [`OFF_ROUTE_KM`] from its route
+    ///   shape, so the `trip_id` doesn't describe the run it's driving;
+    /// - **at a terminal** — the vehicle sits within [`TERMINAL_KM`] of either end of
+    ///   its shape (its start or final terminal), i.e. it's parked at a layover, not
+    ///   late en route; its reported delay is spurious.
+    ///
+    /// The two cases get **different treatment in the archive**, because they mean
+    /// different things now that finished trips linger there:
+    ///
+    /// - an **off-route** vehicle says the `trip_id` never described the run being
+    ///   driven, so the record is *evicted* — it's bad data, and bad data must not be
+    ///   left to decay across the wall of shame for a day;
+    /// - a vehicle **at a terminal** has, in the overwhelming majority of cases, just
+    ///   *arrived*: this is what the end of a trip looks like. So the record is
+    ///   stamped **finished** on the spot, freezing the last honest interior delay and
+    ///   starting its decay immediately, rather than waiting out [`TRIP_END_GRACE`]
+    ///   for the feed to drop it.
+    ///
+    /// Only checks trips we have both a position and a shape for; anything
+    /// unverifiable is left in place. Either way the trip is only held off the *live*
+    /// board — its provenance history keeps accruing (see `poll_once`), so a vehicle
+    /// that pulls away from a layover and is genuinely late again is picked straight
+    /// back up on its watched record. The shape lookups + distance math run on the
+    /// blocking pool.
     async fn drop_offroute_trips(&self, idx: usize, positions: VehiclePositions) {
         let Some(gtfs) = self.loaded_static(idx) else {
             return;
@@ -605,30 +1010,69 @@ impl Scheduler {
             return;
         }
 
-        let offroute: Vec<String> = tokio::task::spawn_blocking(move || {
+        // Each dropped trip tagged with why, for the log.
+        let dropped: Vec<(String, &'static str)> = tokio::task::spawn_blocking(move || {
             to_check
                 .into_iter()
-                .filter(|(trip_id, (lat, lon))| {
-                    gtfs.trip_shape(trip_id)
-                        .and_then(|shape| distance_to_path_km(*lat, *lon, &shape))
-                        .is_some_and(|km| km > OFF_ROUTE_KM)
+                .filter_map(|(trip_id, (lat, lon))| {
+                    let shape = gtfs.trip_shape(&trip_id)?;
+                    if distance_to_path_km(lat, lon, &shape).is_some_and(|km| km > OFF_ROUTE_KM) {
+                        return Some((trip_id, "off-route"));
+                    }
+                    // Distance to a single point (an endpoint) is just point-to-point.
+                    let near_end = |end: (f64, f64)| {
+                        distance_to_path_km(lat, lon, &[end]).is_some_and(|km| km < TERMINAL_KM)
+                    };
+                    if near_end(shape[0]) || near_end(shape[shape.len() - 1]) {
+                        return Some((trip_id, "at-terminal"));
+                    }
+                    None
                 })
-                .map(|(trip_id, _)| trip_id)
                 .collect()
         })
         .await
         .unwrap_or_default();
 
-        if !offroute.is_empty() {
+        if !dropped.is_empty() {
             let name = &self.configs[idx].display_name;
+            let offroute = dropped
+                .iter()
+                .filter(|(_, why)| *why == "off-route")
+                .count();
             eprintln!(
-                "[{name}] dropped {} off-route trip(s) from board",
-                offroute.len()
+                "[{name}] dropped {offroute} off-route + {} at-terminal trip(s) from board",
+                dropped.len() - offroute
             );
             let mut boards = self.boards.lock().unwrap();
             if let Some(trips) = boards.get_mut(&idx) {
-                trips.retain(|t| !offroute.contains(&t.trip_id));
+                trips.retain(|t| !dropped.iter().any(|(id, _)| *id == t.trip_id));
             }
+            drop(boards);
+
+            // Off-route is bad data: erase it. At-terminal is an arrival: freeze it.
+            let bogus: Vec<String> = dropped
+                .iter()
+                .filter(|(_, why)| *why == "off-route")
+                .map(|(id, _)| id.clone())
+                .collect();
+            let evicted = self.evict_archived(idx, &bogus);
+            self.metrics.record_evicted("off_route", evicted as u64);
+
+            let now = unix_now();
+            let mut finished = 0u64;
+            let mut archive = self.archive.lock().unwrap();
+            if let Some(records) = archive.get_mut(&idx) {
+                for (trip_id, _) in dropped.iter().filter(|(_, why)| *why == "at-terminal") {
+                    if let Some(record) = records.get_mut(trip_id)
+                        && record.ended_at.is_none()
+                    {
+                        record.ended_at = Some(now);
+                        finished += 1;
+                    }
+                }
+            }
+            drop(archive);
+            self.metrics.record_finished("terminal", finished);
         }
     }
 
@@ -650,6 +1094,9 @@ impl Scheduler {
         runtime.late_trips = late_trips;
         runtime.vetted_out = vetted_out;
         runtime.peak_vehicles = runtime.peak_vehicles.max(vehicle_count);
+        drop(status);
+        self.metrics.record_poll(true);
+        self.metrics.record_vetted_out(vetted_out as u64);
     }
 
     /// Record a failed poll. `fatal` carries the disabling HTTP status when the
@@ -666,6 +1113,11 @@ impl Scheduler {
         if let Some(code) = fatal {
             runtime.state = SourceState::Failed(code);
             runtime.hot = false;
+        }
+        drop(status);
+        self.metrics.record_poll(false);
+        if fatal.is_some() {
+            self.metrics.record_retirement();
         }
     }
 
@@ -778,19 +1230,24 @@ impl Scheduler {
         }
     }
 
-    /// Build the current global leaderboard: the worst [`LEADERBOARD_SIZE`]
-    /// delayed trips across every agency, ranked most-delayed first.
+    /// Build the current global leaderboard: the worst [`LEADERBOARD_SIZE`] trips
+    /// across every agency, ranked by [score](crate::score) — mostly delay, adjusted
+    /// for how badly the delay breaks the trip and how much of it we watched happen,
+    /// and faded out over 24 hours once the trip has finished running.
+    ///
+    /// Everything a row needs is already frozen into its [`TripRecord`], so this is a
+    /// sort and a clone under one lock — no lookups against the live positions map or
+    /// the trip history, neither of which still remembers a trip that ended hours ago.
     pub fn leaderboard_snapshot(&self) -> LeaderboardSnapshot {
-        let boards = self.boards.lock().unwrap();
-        let positions = self.positions.lock().unwrap();
-        let entries = ranked_trips(&boards)
+        let now = unix_now();
+        let archive = self.archive.lock().unwrap();
+        let entries = ranked_records(&archive, now)
             .into_iter()
             .take(LEADERBOARD_SIZE)
             .enumerate()
-            .map(|(rank, (idx, trip))| {
+            .map(|(rank, (_, idx, record))| {
                 let config = &self.configs[idx];
-                let position = positions.get(&idx).and_then(|feed| feed.get(&trip.trip_id));
-                let provenance = self.history.provenance(idx, &trip.trip_id);
+                let trip = &record.trip;
                 LeaderboardEntry {
                     rank: rank + 1,
                     agency: config.display_name.clone(),
@@ -801,17 +1258,21 @@ impl Scheduler {
                     next_stop: trip.next_stop.clone(),
                     vehicle: trip.vehicle.clone(),
                     delay_seconds: trip.delay_seconds,
+                    peak_delay_seconds: record.peak_delay_seconds,
+                    ended_at: record.ended_at,
                     source: trip.source.label(),
-                    tracked_seconds: provenance.map_or(0, |p| p.tracked_seconds),
-                    birth_delay_seconds: provenance.map_or(0, |p| p.birth_delay_seconds),
-                    latitude: position.map(|(lat, _)| *lat),
-                    longitude: position.map(|(_, lon)| *lon),
+                    tracked_seconds: record.tracked_seconds,
+                    birth_delay_seconds: record.birth_delay_seconds,
+                    latitude: record.latitude,
+                    longitude: record.longitude,
+                    // Debug mode only — see the field's doc for why it isn't always on.
+                    score_breakdown: self.debug.then(|| record.score_inputs(now).breakdown()),
                 }
             })
             .collect();
 
         LeaderboardSnapshot {
-            generated_at: unix_now(),
+            generated_at: now,
             entries,
             debug_enabled: self.debug,
         }
@@ -920,6 +1381,105 @@ impl Scheduler {
         }
     }
 
+    /// The shared metrics registry, for the `/metrics` handler and the API layer's
+    /// own request counters.
+    pub fn metrics(&self) -> &Arc<Metrics> {
+        &self.metrics
+    }
+
+    /// Take a one-shot snapshot of every gauge-style metric from the scheduler's
+    /// live state, for [`Metrics::render`] at scrape time. Each lock is taken
+    /// briefly and independently; nothing here is held across an `.await`.
+    ///
+    /// Deliberately not built on [`status_report`](Self::status_report): that trims
+    /// the `no_realtime` feeds to the largest [`NO_REALTIME_DISPLAY`] for the page, so
+    /// its summary would *undercount* them. Metrics want the true totals, so this
+    /// counts every source directly.
+    pub fn gauge_values(&self) -> GaugeValues {
+        let now = unix_now();
+        let mut values = GaugeValues::default();
+
+        {
+            let status = self.status.lock().unwrap();
+            let mut newest_success: Option<u64> = None;
+            for runtime in status.iter() {
+                let bucket = match runtime.state {
+                    SourceState::Active => 0,
+                    SourceState::RequiresAuth => 1,
+                    SourceState::NoRealtime => 2,
+                    SourceState::NoVehiclePositions => 3,
+                    SourceState::Failed(_) => 4,
+                };
+                values.sources_by_state[bucket] += 1;
+                if runtime.hot {
+                    values.sources_hot += 1;
+                }
+                if runtime.loading {
+                    values.sources_loading += 1;
+                }
+                values.vehicles += runtime.vehicles_now as i64;
+                values.late_trips += runtime.late_trips as i64;
+                if let Some(n) = runtime.total_trips {
+                    values.scheduled_trips += n as i64;
+                }
+                if runtime.last_success == Some(true)
+                    && let Some(t) = runtime.last_poll
+                {
+                    newest_success = newest_success.max(Some(t));
+                }
+            }
+            values.last_successful_poll_timestamp = newest_success.map_or(0, |t| t as i64);
+            // Same rule as `health()`: healthy iff a success landed within the window.
+            values.healthy =
+                newest_success.is_some_and(|t| now.saturating_sub(t) <= HEALTH_STALE_AFTER) as i64;
+        }
+
+        values.sources_static_loaded = self
+            .static_gtfs
+            .lock()
+            .unwrap()
+            .values()
+            .filter(|g| g.is_some())
+            .count() as i64;
+
+        {
+            let archive = self.archive.lock().unwrap();
+            for records in archive.values() {
+                for record in records.values() {
+                    values.archive_trips += 1;
+                    if record.ended_at.is_some() {
+                        values.archive_finished += 1;
+                    }
+                }
+            }
+        }
+
+        // The public board — top and threshold delay, and how many are decaying out.
+        let snapshot = self.leaderboard_snapshot();
+        values.leaderboard_entries = snapshot.entries.len() as i64;
+        values.leaderboard_finished = snapshot
+            .entries
+            .iter()
+            .filter(|e| e.ended_at.is_some())
+            .count() as i64;
+        values.leaderboard_top_delay_seconds =
+            snapshot.entries.first().map_or(0, |e| e.peak_delay_seconds);
+        values.leaderboard_min_delay_seconds =
+            snapshot.entries.last().map_or(0, |e| e.peak_delay_seconds);
+
+        values.ws_connections = [
+            self.updates.receiver_count() as i64,
+            self.status_updates.receiver_count() as i64,
+        ];
+
+        let (sqlite_used, sqlite_peak) = gtfs::sqlite_memory();
+        values.sqlite_bytes = sqlite_used;
+        values.sqlite_peak_bytes = sqlite_peak;
+        values.process_rss_bytes = gtfs::process_rss().unwrap_or(0) as i64;
+
+        values
+    }
+
     /// The geographic route path for one trip on one source, as ordered
     /// `(lat, lon)` points — what the map draws behind the delayed vehicle.
     ///
@@ -1018,6 +1578,35 @@ impl Scheduler {
                 "birth_delay_seconds": p.birth_delay_seconds,
             })
         });
+        // The archive record behind this row: its lifecycle (when it first ranked,
+        // when it was last seen, whether it has finished) and the full score
+        // arithmetic. This is the first thing to look at when the question is "why is
+        // this ranked here" or "why is this still on the board" — the ranking is a
+        // score now, not a delay sort, and a finished trip is ranked on a number that
+        // is still changing after the trip itself has stopped.
+        let record_json = {
+            let now = unix_now();
+            let archive = self.archive.lock().unwrap();
+            archive
+                .get(&idx)
+                .and_then(|records| records.get(trip_id))
+                .map(|record| {
+                    serde_json::json!({
+                        "first_seen": record.first_seen,
+                        "last_seen": record.last_seen,
+                        "ended_at": record.ended_at,
+                        "seconds_since_end": record.ended_at.map(|e| now.saturating_sub(e)),
+                        "peak_delay_seconds": record.peak_delay_seconds,
+                        "scheduled_duration_seconds": record.span.and_then(|s| s.duration_seconds),
+                        "stops_total": record.span.map(|s| s.stops_total),
+                        "stops_remaining": record.span.and_then(|s| s.stops_remaining),
+                        "span_checked": record.span_checked,
+                        "score": record.score(now),
+                        "score_breakdown": record.score_inputs(now).breakdown(),
+                    })
+                })
+        };
+
         let positions = delay::vehicle_positions(&vp_feed);
         let live_pos = positions.get(trip_id).copied();
 
@@ -1088,6 +1677,7 @@ impl Scheduler {
             "computed_delayed_trip": computed_json,
             "raw_observation": observation,
             "delay_history": provenance,
+            "leaderboard_record": record_json,
             "delayed_trips_total": delayed.trips.len(),
             "leaderboard_entry": lb_entry,
             "on_leaderboard": lb_entry.is_some(),
@@ -1210,12 +1800,13 @@ impl Scheduler {
         let loaded = Gtfs::load(
             &config.slug,
             &config.display_name,
-            &config.static_url,
+            &config.all_static_urls(),
             &self.client,
             Path::new(CACHE_DIR),
         )
         .await;
         self.set_loading(idx, false);
+        self.metrics.record_static_load(loaded.is_ok());
         let value = match loaded {
             Ok(gtfs) => {
                 println!("Loaded static GTFS for {}", config.display_name);
@@ -1262,7 +1853,6 @@ impl Scheduler {
     /// hot poll reloads it from the new zip.
     async fn maintain_one(self: Arc<Self>, idx: usize, limiter: Arc<Semaphore>) {
         let config = &self.configs[idx];
-        let zip_path = Path::new(CACHE_DIR).join(format!("{}.zip", config.slug));
 
         // Static-only (`NoRealtime`) feeds are never polled or schedule-compared,
         // so their cache never needs refreshing — count their trips once for the
@@ -1275,7 +1865,18 @@ impl Scheduler {
                 runtime.state == SourceState::NoRealtime,
             )
         };
-        let stale = !no_realtime && gtfs::is_stale(&zip_path, gtfs::STATIC_TTL).await;
+        // A multi-zip feed (MTA Bus) is stale if *any* of its backing zips is — one
+        // borough refreshing forces the merged index to rebuild.
+        let mut stale = false;
+        if !no_realtime {
+            for index in 0..config.all_static_urls().len() {
+                let zip_path = gtfs::zip_cache_path(Path::new(CACHE_DIR), &config.slug, index);
+                if gtfs::is_stale(&zip_path, gtfs::STATIC_TTL).await {
+                    stale = true;
+                    break;
+                }
+            }
+        }
         if !stale && !need_count {
             return;
         }
@@ -1286,7 +1887,7 @@ impl Scheduler {
             let result = gtfs::count_trips(
                 &config.slug,
                 &config.display_name,
-                &config.static_url,
+                &config.all_static_urls(),
                 &self.client,
                 Path::new(CACHE_DIR),
             )
@@ -1294,6 +1895,7 @@ impl Scheduler {
             self.set_loading(idx, false);
             result
         };
+        self.metrics.record_census(count.is_ok());
         match count {
             Ok(n) => self.status.lock().unwrap()[idx].total_trips = Some(n),
             Err(err) => eprintln!(
@@ -1315,7 +1917,10 @@ impl Scheduler {
         ticker.tick().await; // consume the immediate first tick
         loop {
             ticker.tick().await;
-            print_leaderboard(&self.boards.lock().unwrap(), &self.configs);
+            // Retire trips whose feeds have stopped reporting them and expire the ones
+            // that have decayed out, so the board about to be rendered is already aged.
+            self.sweep_archive();
+            print_leaderboard(&self.archive.lock().unwrap(), &self.configs, unix_now());
             self.broadcast_update();
         }
     }
@@ -1366,28 +1971,6 @@ fn head<const N: usize>(fields: [(&str, Value); N]) -> Map<String, Value> {
         .into_iter()
         .map(|(key, value)| (key.to_string(), value))
         .collect()
-}
-
-/// Whether agency `idx` currently has a vehicle in the global top
-/// [`LEADERBOARD_SIZE`] by delay.
-///
-/// Rather than sorting every trip in the system on each poll, we take this
-/// agency's worst delay and count how many trips across all agencies are
-/// strictly worse: if fewer than [`LEADERBOARD_SIZE`] beat it, it's on the
-/// board. That's a single O(n) pass with no allocation.
-fn leaderboard_contains(boards: &HashMap<usize, Vec<DelayedTrip>>, idx: usize) -> bool {
-    let Some(best) = boards
-        .get(&idx)
-        .and_then(|trips| trips.iter().map(|t| t.delay_seconds).max())
-    else {
-        return false;
-    };
-    let ahead = boards
-        .values()
-        .flatten()
-        .filter(|t| t.delay_seconds > best)
-        .count();
-    ahead < LEADERBOARD_SIZE
 }
 
 /// Shortest distance in km from a point to a polyline (a route shape), via a local
@@ -1488,26 +2071,42 @@ fn unix_now() -> u64 {
     chrono::Utc::now().timestamp().max(0) as u64
 }
 
-/// Every delayed trip across all agencies, most-delayed first, tagged with its
-/// agency index. Shared by the websocket snapshot and the console printer.
-fn ranked_trips(boards: &HashMap<usize, Vec<DelayedTrip>>) -> Vec<(usize, &DelayedTrip)> {
-    let mut ranked: Vec<(usize, &DelayedTrip)> = boards
+/// Every archived trip across all agencies, highest-scoring first, tagged with its
+/// score and agency index. Shared by the websocket snapshot and the console printer.
+///
+/// The score is computed once per record and carried, rather than recomputed inside
+/// the comparator — a sort calls its comparator O(n log n) times, and the score isn't
+/// free.
+fn ranked_records(
+    archive: &HashMap<usize, HashMap<String, TripRecord>>,
+    now: u64,
+) -> Vec<(f64, usize, &TripRecord)> {
+    let mut ranked: Vec<(f64, usize, &TripRecord)> = archive
         .iter()
-        .flat_map(|(&idx, trips)| trips.iter().map(move |trip| (idx, trip)))
+        .flat_map(|(&idx, records)| {
+            records
+                .values()
+                .map(move |record| (record.score(now), idx, record))
+        })
         .collect();
-    ranked.sort_by_key(|(_, trip)| Reverse(trip.delay_seconds));
+    ranked.sort_by(|(a, _, _), (b, _, _)| b.total_cmp(a));
     ranked
 }
 
-/// Print the top delayed trips across every agency.
-fn print_leaderboard(boards: &HashMap<usize, Vec<DelayedTrip>>, configs: &[AgencyConfig]) {
-    let ranked = ranked_trips(boards);
+/// Print the top-scoring trips across every agency.
+fn print_leaderboard(
+    archive: &HashMap<usize, HashMap<String, TripRecord>>,
+    configs: &[AgencyConfig],
+    now: u64,
+) {
+    let ranked = ranked_records(archive, now);
 
     println!("\n=== America's Most Delayed ===");
     if ranked.is_empty() {
         println!("(no delays reported right now)");
     }
-    for (rank, (idx, trip)) in ranked.iter().take(LEADERBOARD_SIZE).enumerate() {
+    for (rank, (score, idx, record)) in ranked.iter().take(LEADERBOARD_SIZE).enumerate() {
+        let trip = &record.trip;
         let agency = configs[*idx].display_name.as_str();
         let headsign = trip
             .headsign
@@ -1520,18 +2119,28 @@ fn print_leaderboard(boards: &HashMap<usize, Vec<DelayedTrip>>, configs: &[Agenc
             agency,
             trip.route,
             headsign,
-            format_delay(trip.delay_seconds),
+            format_delay(record.peak_delay_seconds),
         );
 
         let mut details = Vec::new();
-        if let Some(next_stop) = &trip.next_stop {
-            details.push(format!("next stop {next_stop}"));
+        // A finished trip is still on the board, fading — say so, so the console
+        // doesn't read as though a bus that arrived an hour ago is still out there.
+        match record.ended_at {
+            Some(ended) => details.push(format!(
+                "finished {} ago",
+                format_delay(now.saturating_sub(ended) as i64)
+            )),
+            None if trip.next_stop.is_some() => {
+                details.push(format!("next stop {}", trip.next_stop.as_deref().unwrap()))
+            }
+            None => {}
         }
         if let Some(vehicle) = &trip.vehicle {
             details.push(format!("bus {vehicle}"));
         }
         details.push(format!("trip {}", trip.trip_id));
         details.push(format!("[{}]", trip.source.label()));
+        details.push(format!("score {score:.1}"));
         println!("     {}", details.join(" · "));
     }
     println!();
@@ -1552,6 +2161,10 @@ fn format_delay(seconds: i64) -> String {
 /// return the shared [`Scheduler`] handle for the API layer to read. Must be
 /// called from within a Tokio runtime.
 pub fn start(configs: Vec<AgencyConfig>, auth: Arc<FeedAuth>) -> Result<Arc<Scheduler>> {
+    // Reclaim any temp files a previous run left mid-build before we start writing
+    // new ones — nothing is building yet, so every `*.tmp`/`*.sqltmp` present is stale.
+    gtfs::sweep_stale_temp_files(Path::new(CACHE_DIR));
+
     let client = Client::builder()
         .timeout(REQUEST_TIMEOUT)
         .user_agent(USER_AGENT)

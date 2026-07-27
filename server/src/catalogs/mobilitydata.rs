@@ -388,6 +388,7 @@ impl MobilityDataProvider {
                 slug,
                 display_name: build.display_name.unwrap_or_default(),
                 static_url,
+                extra_static_urls: Vec::new(),
                 realtime_urls: GtfsRtUrls {
                     trip_updates_url: dedup(build.trip_updates_url),
                     vehicle_positions_url: dedup(build.vehicle_positions_url),

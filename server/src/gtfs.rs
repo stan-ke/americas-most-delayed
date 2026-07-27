@@ -131,20 +131,24 @@ impl Gtfs {
     ///
     /// The download is async; the (one-time) import and the connection open are
     /// CPU/IO-bound and run on the blocking pool so they never stall the runtime.
+    /// `static_urls` is normally one URL, but a feed whose realtime stream spans
+    /// several separately-published static zips (MTA Bus's five boroughs) passes all
+    /// of them; they're merged into a single SQLite index so any of the feed's trips
+    /// can resolve stop names and shapes.
     pub async fn load(
         slug: &str,
         display_name: &str,
-        static_url: &str,
+        static_urls: &[String],
         client: &Client,
         cache_dir: &Path,
     ) -> Result<Gtfs> {
-        let zip_path = download_static_feed(slug, display_name, static_url, client, cache_dir)
+        let zip_paths = download_static_feeds(slug, display_name, static_urls, client, cache_dir)
             .await
             .with_context(|| format!("downloading static GTFS for {display_name}"))?;
 
         let db_path = cache_dir.join(format!("{slug}.sqlite"));
         let display_name = display_name.to_string();
-        tokio::task::spawn_blocking(move || open_or_build(zip_path, db_path, display_name)).await?
+        tokio::task::spawn_blocking(move || open_or_build(zip_paths, db_path, display_name)).await?
     }
 
     /// Run a prepared single-row query and return its first column as an optional
@@ -314,6 +318,40 @@ impl Gtfs {
         .filter(|t| t.first.0.is_some())
     }
 
+    /// The shape of a trip as the timetable plans it: how long it takes end to end,
+    /// how many stops it serves, and how many of those are still ahead of a vehicle
+    /// currently at `stop_sequence`.
+    ///
+    /// This is what lets the leaderboard score a delay *relative to the trip* rather
+    /// than in the abstract (see [`crate::score`]): half an hour is a different event
+    /// on a 20-minute shuttle than on a 3-hour rail run, and a trip with thirty stops
+    /// still ahead of it is doing damage a nearly-finished one isn't.
+    ///
+    /// One indexed pass over the trip's `stop_times`. `current_sequence` binds NULL
+    /// when the feed gave us no position, which leaves `stops_remaining` unknown
+    /// rather than guessing at zero — the score treats unknown as neutral. Static
+    /// data, so callers cache the answer for the life of the trip.
+    pub fn trip_span(&self, trip_id: &str, current_sequence: Option<u32>) -> Option<TripSpan> {
+        let conn = self.db.lock().ok()?;
+        conn.prepare_cached(
+            "SELECT max(time) - min(time), count(*), sum(stop_sequence > ?2) \
+             FROM stop_times WHERE trip_id = ?1",
+        )
+        .ok()?
+        .query_row(params![trip_id, current_sequence.map(|s| s as i64)], |r| {
+            Ok(TripSpan {
+                duration_seconds: r.get::<_, Option<i64>>(0)?,
+                stops_total: r.get::<_, Option<i64>>(1)?.unwrap_or(0),
+                stops_remaining: r.get::<_, Option<i64>>(2)?,
+            })
+        })
+        .optional()
+        .ok()?
+        // A trip with no `stop_times` rows aggregates to all-NULL: we know nothing
+        // about it, which is not the same as knowing it has zero stops.
+        .filter(|span| span.stops_total > 0)
+    }
+
     /// Everything the delay math sees for one trip in this static schedule, as a
     /// JSON blob for a debug capture: the agency timezone, the trip's row, and its
     /// full ordered `stop_times`. Best-effort — a lock or query failure yields
@@ -372,6 +410,21 @@ pub struct TerminalStops {
     pub last: (Option<u32>, Option<String>),
 }
 
+/// How the timetable plans a trip, as returned by [`Gtfs::trip_span`] — the scale a
+/// delay is judged against by [`crate::score`].
+#[derive(Debug, Clone, Copy)]
+pub struct TripSpan {
+    /// Scheduled running time, first stop to last. `None` when the schedule carries
+    /// no usable times for the trip.
+    pub duration_seconds: Option<i64>,
+    /// Stops the trip serves in total. Always at least 1 (a span with none isn't
+    /// returned at all).
+    pub stops_total: i64,
+    /// Stops still ahead of the vehicle. `None` when the feed gave no position in
+    /// the sequence to measure from.
+    pub stops_remaining: Option<i64>,
+}
+
 /// Where a trip is signed for: its `trip_headsign`, falling back to its
 /// destination (final stop).
 pub fn trip_headsign(gtfs: &Gtfs, trip_id: &str, trip: &Trip) -> Option<String> {
@@ -426,9 +479,9 @@ pub fn process_rss() -> Option<u64> {
 
 /// Open a feed's SQLite index read-only, (re)building it from the cached zip when
 /// the db is missing or older than the zip. Blocking; run via [`Gtfs::load`].
-fn open_or_build(zip_path: PathBuf, db_path: PathBuf, display_name: String) -> Result<Gtfs> {
-    if needs_rebuild(&db_path, &zip_path) {
-        build_sqlite(&zip_path, &db_path, &display_name)
+fn open_or_build(zip_paths: Vec<PathBuf>, db_path: PathBuf, display_name: String) -> Result<Gtfs> {
+    if needs_rebuild(&db_path, &zip_paths) {
+        build_sqlite(&zip_paths, &db_path, &display_name)
             .with_context(|| format!("building SQLite index for {display_name}"))?;
     }
 
@@ -463,13 +516,15 @@ fn open_or_build(zip_path: PathBuf, db_path: PathBuf, display_name: String) -> R
     })
 }
 
-/// Whether the SQLite index must be rebuilt: it's missing, or the cached zip it
+/// Whether the SQLite index must be rebuilt: it's missing, or *any* cached zip it
 /// was derived from is newer (a maintenance refresh re-downloaded a fresh zip).
-fn needs_rebuild(db_path: &Path, zip_path: &Path) -> bool {
-    match (mtime(db_path), mtime(zip_path)) {
-        (Some(db), Some(zip)) => db < zip,
-        _ => true,
-    }
+fn needs_rebuild(db_path: &Path, zip_paths: &[PathBuf]) -> bool {
+    let Some(db) = mtime(db_path) else {
+        return true;
+    };
+    zip_paths
+        .iter()
+        .any(|zip| mtime(zip).is_none_or(|zip| db < zip))
 }
 
 /// A file's modification time, or `None` if it can't be read.
@@ -477,19 +532,30 @@ fn mtime(path: &Path) -> Option<SystemTime> {
     std::fs::metadata(path).ok()?.modified().ok()
 }
 
-/// Import a cached GTFS zip into a fresh SQLite database, streaming each CSV
-/// member row-by-row so no whole table is ever collected in memory. Built to a
+/// Import one or more cached GTFS zips into a fresh SQLite database, streaming each
+/// CSV member row-by-row so no whole table is ever collected in memory. Built to a
 /// unique temp file and atomically renamed into place, so a concurrent build or a
 /// crash mid-import can't leave a half-written index.
-fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<()> {
-    println!("[{display_name}] building SQLite index from static GTFS");
-    let mut archive = open_zip(zip_path)
-        .with_context(|| format!("opening static GTFS zip for {display_name}"))?;
+///
+/// Multiple zips (MTA Bus's five boroughs) are imported into the same tables within
+/// one transaction. GTFS ids are disjoint across those zips, so the keyed tables'
+/// `OR REPLACE` never collides and `stop_times`/`shapes` simply accumulate.
+fn build_sqlite(zip_paths: &[PathBuf], db_path: &Path, display_name: &str) -> Result<()> {
+    println!(
+        "[{display_name}] building SQLite index from {} static GTFS zip(s)",
+        zip_paths.len()
+    );
 
     let seq = TMP_SEQ.fetch_add(1, Ordering::Relaxed);
     let file_name = db_path.file_name().and_then(|s| s.to_str()).unwrap_or("db");
     let tmp = db_path.with_file_name(format!("{file_name}.{seq}.sqltmp"));
     let _ = std::fs::remove_file(&tmp);
+
+    // Any `?` past this point leaves a partial temp db behind, and the next rebuild
+    // takes a fresh `seq` so it would never be reused — a bad zip or import error
+    // would leak a multi-hundred-MB file on every TTL refresh until the disk fills.
+    // The guard removes it unless we disarm after the successful rename.
+    let mut cleanup = TempCleanup::arm(&tmp);
 
     let conn = Connection::open(&tmp).with_context(|| format!("creating {}", tmp.display()))?;
     // Import speed: no rollback journal and no fsync — the db is a rebuildable
@@ -500,10 +566,95 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
     conn.execute_batch(SCHEMA)?;
     conn.execute_batch("BEGIN")?;
 
+    for zip_path in zip_paths {
+        let mut archive = open_zip(zip_path)
+            .with_context(|| format!("opening static GTFS zip for {display_name}"))?;
+        import_members(&conn, &mut archive)
+            .with_context(|| format!("importing {}", zip_path.display()))?;
+    }
+
+    conn.execute_batch("COMMIT")?;
+    // Build the big-table indexes after bulk load, not during it.
+    conn.execute_batch(
+        "CREATE INDEX idx_stop_times_trip ON stop_times(trip_id);
+         CREATE INDEX idx_shapes_shape ON shapes(shape_id);",
+    )?;
+    drop(conn);
+
+    std::fs::rename(&tmp, db_path).with_context(|| format!("finalizing {}", db_path.display()))?;
+    cleanup.disarm();
+    Ok(())
+}
+
+/// Removes a temp file when dropped, unless [`disarm`](Self::disarm)ed. Guards the
+/// partial `.sqltmp` a [`build_sqlite`] leaves behind if it bails before its atomic
+/// rename, so a failed rebuild doesn't leak the temp db (see the call site).
+struct TempCleanup(Option<PathBuf>);
+
+impl TempCleanup {
+    fn arm(path: &Path) -> Self {
+        TempCleanup(Some(path.to_path_buf()))
+    }
+
+    /// Give up ownership after the temp has been renamed into place — nothing to
+    /// clean up.
+    fn disarm(&mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for TempCleanup {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Reclaim orphaned temp files left in the cache by a download or SQLite build that
+/// was interrupted — a crash, or an import that errored before its atomic rename.
+///
+/// Every temp carries a unique per-process sequence number and is never reused, so on
+/// a fresh start — when nothing is building yet — every `*.tmp` / `*.sqltmp` present is
+/// a corpse from a previous run and safe to remove. Without this they accumulate
+/// across restarts and 24h TTL rebuilds until the disk fills. Best-effort: a directory
+/// we can't read (e.g. it doesn't exist yet) is simply skipped.
+pub fn sweep_stale_temp_files(cache_dir: &Path) {
+    let Ok(entries) = std::fs::read_dir(cache_dir) else {
+        return;
+    };
+    let mut removed = 0u64;
+    let mut bytes = 0u64;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let is_temp = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .is_some_and(|ext| ext == "tmp" || ext == "sqltmp");
+        if is_temp {
+            let size = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            if std::fs::remove_file(&path).is_ok() {
+                removed += 1;
+                bytes += size;
+            }
+        }
+    }
+    if removed > 0 {
+        println!(
+            "Reclaimed {removed} orphaned temp file(s) ({:.1} MB) from {}",
+            bytes as f64 / 1_048_576.0,
+            cache_dir.display()
+        );
+    }
+}
+
+/// Stream every table of one opened GTFS archive into the shared connection. Called
+/// once per zip by [`build_sqlite`], inside its transaction.
+fn import_members(conn: &Connection, archive: &mut Zip) -> Result<()> {
     // agency: only the timezone, first non-empty row wins at query time.
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "agency.txt",
         "INSERT INTO agency(timezone) VALUES(?1)",
         |row, stmt| match row.get_non_empty("agency_timezone") {
@@ -515,8 +666,8 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
     // routes / stops / trips are keyed; `OR REPLACE` makes later rows win on a
     // duplicate id.
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "routes.txt",
         "INSERT OR REPLACE INTO routes(route_id, short_name, long_name) VALUES(?1,?2,?3)",
         |row, stmt| match row.get_non_empty("route_id") {
@@ -532,8 +683,8 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
     )?;
 
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "stops.txt",
         "INSERT OR REPLACE INTO stops(stop_id, stop_name) VALUES(?1,?2)",
         |row, stmt| match row.get_non_empty("stop_id") {
@@ -545,8 +696,8 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
     )?;
 
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "trips.txt",
         "INSERT OR REPLACE INTO trips(trip_id, route_id, trip_headsign, direction_id, shape_id) \
          VALUES(?1,?2,?3,?4,?5)",
@@ -571,8 +722,8 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
 
     // stop_times: the big one. Bake arrival-else-departure into a single `time`.
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "stop_times.txt",
         "INSERT INTO stop_times(trip_id, stop_sequence, stop_id, time) VALUES(?1,?2,?3,?4)",
         |row, stmt| {
@@ -600,8 +751,8 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
 
     // shapes: the other big one, only rows with a usable id and coordinates.
     insert_member(
-        &conn,
-        &mut archive,
+        conn,
+        archive,
         "shapes.txt",
         "INSERT INTO shapes(shape_id, seq, lat, lon) VALUES(?1,?2,?3,?4)",
         |row, stmt| {
@@ -625,15 +776,6 @@ fn build_sqlite(zip_path: &Path, db_path: &Path, display_name: &str) -> Result<(
         },
     )?;
 
-    conn.execute_batch("COMMIT")?;
-    // Build the big-table indexes after bulk load, not during it.
-    conn.execute_batch(
-        "CREATE INDEX idx_stop_times_trip ON stop_times(trip_id);
-         CREATE INDEX idx_shapes_shape ON shapes(shape_id);",
-    )?;
-    drop(conn);
-
-    std::fs::rename(&tmp, db_path).with_context(|| format!("finalizing {}", db_path.display()))?;
     Ok(())
 }
 
@@ -668,14 +810,17 @@ fn insert_member(
 pub async fn count_trips(
     slug: &str,
     display_name: &str,
-    static_url: &str,
+    static_urls: &[String],
     client: &Client,
     cache_dir: &Path,
 ) -> Result<usize> {
-    let zip_path = download_static_feed(slug, display_name, static_url, client, cache_dir)
+    let zip_paths = download_static_feeds(slug, display_name, static_urls, client, cache_dir)
         .await
         .with_context(|| format!("downloading static GTFS for {display_name}"))?;
-    tokio::task::spawn_blocking(move || count_trips_in_zip(&zip_path)).await?
+    // Each backing zip's trip ids are disjoint (MTA Bus's boroughs), so summing the
+    // per-zip distinct counts matches the merged `trips` table.
+    tokio::task::spawn_blocking(move || zip_paths.iter().map(|p| count_trips_in_zip(p)).sum())
+        .await?
 }
 
 /// Count distinct non-empty `trip_id`s in `trips.txt`, matching the semantics of
@@ -747,16 +892,47 @@ async fn cached_zip_is_valid(path: &Path) -> bool {
     file.read_exact(&mut magic).await.is_ok() && looks_like_zip(&magic)
 }
 
-/// Return the path to the agency's cached static GTFS zip, downloading it first
-/// if the cache is missing, stale ([`STATIC_TTL`]), or holding a non-zip body.
+/// The on-disk cache path for one of a feed's static zips. The primary (`index 0`)
+/// keeps the historic `<slug>.zip` name — so existing caches, the census, and the
+/// maintenance refresh keep working unchanged — while extra zips (MTA Bus's other
+/// boroughs) get `<slug>.staticN.zip`.
+pub fn zip_cache_path(cache_dir: &Path, slug: &str, index: usize) -> PathBuf {
+    if index == 0 {
+        cache_dir.join(format!("{slug}.zip"))
+    } else {
+        cache_dir.join(format!("{slug}.static{index}.zip"))
+    }
+}
+
+/// Download every static zip backing a feed (primary first, then any extras),
+/// returning their cache paths in order. Fetched sequentially — a feed has at most a
+/// handful of zips, and the shared fetch limiter already caps concurrency across
+/// feeds.
+async fn download_static_feeds(
+    slug: &str,
+    display_name: &str,
+    static_urls: &[String],
+    client: &Client,
+    cache_dir: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = Vec::with_capacity(static_urls.len());
+    for (index, url) in static_urls.iter().enumerate() {
+        paths.push(download_static_feed(slug, display_name, url, index, client, cache_dir).await?);
+    }
+    Ok(paths)
+}
+
+/// Return the path to one of the agency's cached static GTFS zips, downloading it
+/// first if the cache is missing, stale ([`STATIC_TTL`]), or holding a non-zip body.
 async fn download_static_feed(
     slug: &str,
     display_name: &str,
     static_url: &str,
+    index: usize,
     client: &Client,
     cache_dir: &Path,
 ) -> Result<PathBuf> {
-    let zip_path = cache_dir.join(format!("{slug}.zip"));
+    let zip_path = zip_cache_path(cache_dir, slug, index);
     if zip_path.exists() {
         if !cached_zip_is_valid(&zip_path).await {
             // Poison from an earlier run (see [`looks_like_zip`]). Drop it rather than

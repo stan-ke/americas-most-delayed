@@ -3,116 +3,131 @@
 //! Most feeds we poll are open, but a handful gate their realtime data behind a
 //! credential — an HTTP header (STM, OC Transpo), a query parameter (MTA Bus Time,
 //! the Puget Sound OneBusAway server), or a value baked into the URL path (TriMet's
-//! app id). This module is the one place that knows about those credentials.
+//! app id). This module is the one place that knows how those credentials are
+//! applied, but it knows *nothing* hard-coded about which agencies they belong to.
 //!
-//! **Secrets never live in the source tree.** They're read at startup from a
-//! git-ignored `keys.env` file (`KEY=value` lines, `#` comments), so the operator
-//! drops the keys they were handed into `keys.env` and nothing sensitive is ever
-//! committed. The path defaults to `./keys.env` and is overridable with
-//! `AMD_KEYS_FILE` (handy when running from a different working directory).
+//! **The rules are data, not code.** Both the host→credential injection rules and
+//! the hand-configured gated agencies live in a checked-in, secret-free
+//! [`auth.json`](../../auth.json) (path overridable with `AMD_AUTH_FILE`). Adding a
+//! new authenticated agency is a JSON edit plus a secret in `keys.env` — no
+//! recompile. See [`AuthConfig`] for the schema.
+//!
+//! **Secrets never live in the source tree, nor in `auth.json`.** They're read at
+//! startup from a git-ignored `keys.env` file (`KEY=value` lines, `#` comments), so
+//! the operator drops the keys they were handed into `keys.env` and nothing
+//! sensitive is ever committed. The path defaults to `./keys.env` and is overridable
+//! with `AMD_KEYS_FILE`. `auth.json` and the agency configs reference credentials
+//! only by *name*; the value is looked up in `keys.env` at fetch/build time.
 //!
 //! The design is deliberately decoupled from the catalog: [`FeedAuth::apply`]
 //! matches an outbound request by its URL host and injects the right credential, so
-//! *any* request pointed at a known host is authenticated — whether the config was
-//! hand-written (see [`crate::agency::authed_agencies`]) or came from a catalog.
-//! Adding a new header/query-authenticated agency is two edits: drop its secret in
-//! `keys.env`, and add one line to [`INJECTIONS`].
+//! *any* request pointed at a known host is authenticated. Path-embedded credentials
+//! are spliced in via `{KEY}` placeholders in an agency's URLs (see
+//! [`FeedAuth::authed_agencies`]), so even those need no bespoke Rust.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::Path;
 
 use reqwest::{Client, RequestBuilder};
+use serde::Deserialize;
 
-// Names of the credentials, as they appear in `keys.env`. Public so config
-// construction can read a path-embedded secret (TriMet) or gate a feed on whether
-// its key is present.
-pub const STM_API_KEY: &str = "STM_API_KEY";
-pub const OCTRANSPO_API_KEY: &str = "OCTRANSPO_API_KEY";
-pub const MTA_BUSTIME_KEY: &str = "MTA_BUSTIME_KEY";
-pub const PUGET_SOUND_KEY: &str = "PUGET_SOUND_KEY";
-pub const TRIMET_APP_ID: &str = "TRIMET_APP_ID";
+use crate::agency::{AgencyConfig, GeoPoint, GtfsRtUrls};
 
-/// Every credential name we know about — used only for the startup summary, so a
-/// key present in `keys.env` but missing (or vice versa) is visible at a glance.
-const KNOWN_KEYS: &[&str] = &[
-    STM_API_KEY,
-    OCTRANSPO_API_KEY,
-    MTA_BUSTIME_KEY,
-    PUGET_SOUND_KEY,
-    TRIMET_APP_ID,
-];
+/// The JSON auth config (`auth.json`): the host→credential injection rules and the
+/// hand-configured gated agencies. Holds no secrets — only credential *names*, which
+/// are resolved against `keys.env` at runtime. Unknown fields (e.g. `"//"` comment
+/// keys) are ignored, so the file can carry documentation inline.
+#[derive(Debug, Default, Deserialize)]
+struct AuthConfig {
+    #[serde(default)]
+    injections: Vec<Injection>,
+    #[serde(default)]
+    agencies: Vec<AuthAgency>,
+}
 
 /// How a credential rides on a request.
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "snake_case")]
 enum Inject {
-    /// An HTTP request header, e.g. `apiKey: <secret>`.
-    Header(&'static str),
-    /// A URL query parameter, e.g. `?key=<secret>`.
-    Query(&'static str),
+    /// An HTTP request header, e.g. `{"header": "apiKey"}` → `apiKey: <secret>`.
+    Header(String),
+    /// A URL query parameter, e.g. `{"query": "key"}` → `?key=<secret>`.
+    Query(String),
 }
 
 /// One host→credential rule: a request whose URL host matches `host` gets the
 /// secret named `key` injected per `inject`.
 ///
 /// Path-embedded credentials (TriMet bakes its app id into the URL path) aren't
-/// here — there's no generic way to splice a value into an arbitrary path, so those
-/// are built into the URL when the config is constructed.
+/// here — they use a `{KEY}` placeholder in the agency's URLs instead, substituted
+/// when the config is built (see [`FeedAuth::authed_agencies`]).
+#[derive(Debug, Clone, Deserialize)]
 struct Injection {
-    host: &'static str,
-    key: &'static str,
+    host: String,
+    key: String,
     inject: Inject,
 }
 
-/// The header/query credentials, keyed by the host they authenticate. Add a line
-/// to authenticate a new host; its secret is looked up by `key` in `keys.env`, and
-/// the rule stays inert until that secret is present.
-const INJECTIONS: &[Injection] = &[
-    Injection {
-        host: "api.stm.info",
-        key: STM_API_KEY,
-        inject: Inject::Header("apiKey"),
-    },
-    Injection {
-        host: "nextrip-public-api.azure-api.net",
-        key: OCTRANSPO_API_KEY,
-        inject: Inject::Header("Ocp-Apim-Subscription-Key"),
-    },
-    Injection {
-        host: "gtfsrt.prod.obanyc.com",
-        key: MTA_BUSTIME_KEY,
-        inject: Inject::Query("key"),
-    },
-    Injection {
-        host: "api.pugetsound.onebusaway.org",
-        key: PUGET_SOUND_KEY,
-        inject: Inject::Query("key"),
-    },
-];
+/// A hand-configured feed the public catalogs gate behind auth (we hold a key) or
+/// mislabel as having no realtime. Mirrors [`AgencyConfig`], plus:
+///
+/// - `requires_key`: when set, the agency is dropped unless that credential is
+///   present in `keys.env` — so a missing key silently omits the agency rather than
+///   polling it into a `401`. `null`/absent means always built (e.g. MTA Subway,
+///   which is open but which the catalogs wrongly mark `no_realtime`).
+/// - Any `{KEY}` placeholder in a URL is substituted from `keys.env` at build time;
+///   an unresolved placeholder drops the agency. This is how path-embedded
+///   credentials are injected without bespoke code.
+#[derive(Debug, Clone, Deserialize)]
+struct AuthAgency {
+    slug: String,
+    display_name: String,
+    #[serde(default)]
+    requires_key: Option<String>,
+    static_url: String,
+    /// Extra static GTFS zips merged into the same schedule index as `static_url`
+    /// (e.g. MTA Bus's other-borough schedules). See
+    /// [`AgencyConfig::extra_static_urls`].
+    #[serde(default)]
+    extra_static_urls: Vec<String>,
+    #[serde(default)]
+    trip_updates_urls: Vec<String>,
+    #[serde(default)]
+    vehicle_positions_urls: Vec<String>,
+    #[serde(default)]
+    country_code: Option<String>,
+    /// `[lat, lon]` in degrees, used only for cross-catalog dedup.
+    #[serde(default)]
+    location: Option<[f64; 2]>,
+}
 
-/// Feed credentials loaded from `keys.env`, plus the machinery to apply them.
+/// Feed credentials loaded from `keys.env`, plus the rules loaded from `auth.json`
+/// and the machinery to apply them.
 pub struct FeedAuth {
     secrets: HashMap<String, String>,
+    injections: Vec<Injection>,
+    agencies: Vec<AuthAgency>,
 }
 
 impl FeedAuth {
-    /// Load credentials from `keys.env` (path overridable with `AMD_KEYS_FILE`).
+    /// Load credentials from `keys.env` (path overridable with `AMD_KEYS_FILE`) and
+    /// rules from `auth.json` (path overridable with `AMD_AUTH_FILE`).
     ///
-    /// A missing file is not an error — it just means no credentials are configured,
-    /// so the gated feeds are skipped. Prints a summary of which credentials were
-    /// found, never their values.
+    /// Neither file being present is an error — a missing `keys.env` just means no
+    /// credentials are configured (gated feeds skipped), and a missing/invalid
+    /// `auth.json` means no injection rules or hand-configured agencies. Prints a
+    /// summary of which credentials were found, never their values.
     pub fn load() -> Self {
-        let path = std::env::var("AMD_KEYS_FILE").unwrap_or_else(|_| "keys.env".to_string());
+        let keys_path = std::env::var("AMD_KEYS_FILE").unwrap_or_else(|_| "keys.env".to_string());
+        let auth_path = std::env::var("AMD_AUTH_FILE").unwrap_or_else(|_| "auth.json".to_string());
+        let config = load_config(Path::new(&auth_path));
         let auth = FeedAuth {
-            secrets: read_env_file(Path::new(&path)),
+            secrets: read_env_file(Path::new(&keys_path)),
+            injections: config.injections,
+            agencies: config.agencies,
         };
-        auth.log_summary(&path);
+        auth.log_summary(&keys_path);
         auth
-    }
-
-    /// Build directly from a secrets map — used by tests.
-    #[cfg(test)]
-    pub fn from_secrets(secrets: HashMap<String, String>) -> Self {
-        FeedAuth { secrets }
     }
 
     /// The secret for `key`, if configured and non-empty.
@@ -139,12 +154,12 @@ impl FeedAuth {
     pub fn apply(&self, client: &Client, url: &str) -> RequestBuilder {
         let mut final_url = url.to_string();
         let mut headers: Vec<(&str, &str)> = Vec::new();
-        for inj in INJECTIONS {
-            if url_has_host(url, inj.host)
-                && let Some(secret) = self.get(inj.key)
+        for inj in &self.injections {
+            if url_has_host(url, &inj.host)
+                && let Some(secret) = self.get(&inj.key)
             {
-                match inj.inject {
-                    Inject::Header(name) => headers.push((name, secret)),
+                match &inj.inject {
+                    Inject::Header(name) => headers.push((name.as_str(), secret)),
                     Inject::Query(name) => final_url = append_query(&final_url, name, secret),
                 }
             }
@@ -156,32 +171,170 @@ impl FeedAuth {
         req
     }
 
-    /// Print which known credentials were found (by name — never the value).
+    /// Build the hand-configured gated agencies from `auth.json`. An agency with a
+    /// `requires_key` whose secret is absent is silently skipped; an agency with an
+    /// unresolved `{KEY}` placeholder in any URL is skipped with a warning. The
+    /// result is prepended after NJ Transit in `main::collect_agencies`, so these win
+    /// cross-catalog dedup over the catalogs' `requires_auth` / `no_realtime`
+    /// versions of the same agency.
+    pub fn authed_agencies(&self) -> Vec<AgencyConfig> {
+        let mut configs = Vec::new();
+        for agency in &self.agencies {
+            if let Some(key) = &agency.requires_key
+                && !self.has(key)
+            {
+                continue;
+            }
+            let (
+                Some(static_url),
+                Some(extra_static_urls),
+                Some(trip_updates_url),
+                Some(vehicle_positions_url),
+            ) = (
+                self.substitute(&agency.static_url),
+                self.substitute_all(&agency.extra_static_urls),
+                self.substitute_all(&agency.trip_updates_urls),
+                self.substitute_all(&agency.vehicle_positions_urls),
+            )
+            else {
+                eprintln!(
+                    "Feed auth: skipping '{}' — unresolved credential placeholder in a URL",
+                    agency.slug
+                );
+                continue;
+            };
+            configs.push(AgencyConfig {
+                slug: agency.slug.clone(),
+                display_name: agency.display_name.clone(),
+                static_url,
+                extra_static_urls,
+                realtime_urls: GtfsRtUrls {
+                    trip_updates_url,
+                    vehicle_positions_url,
+                },
+                gtfs_rt_requires_auth: Some(false),
+                country_code: agency.country_code.clone(),
+                location: agency.location.map(|[lat, lon]| GeoPoint::new(lat, lon)),
+            });
+        }
+        configs
+    }
+
+    /// Replace every `{KEY}` placeholder in `template` with the secret named `KEY`.
+    /// Returns `None` if any referenced secret is missing or empty, so an agency with
+    /// a broken URL is dropped rather than polled with a literal `{KEY}` in it. A
+    /// template with no placeholders passes through unchanged.
+    fn substitute(&self, template: &str) -> Option<String> {
+        let mut out = String::with_capacity(template.len());
+        let mut rest = template;
+        while let Some(start) = rest.find('{') {
+            out.push_str(&rest[..start]);
+            let after = &rest[start + 1..];
+            let end = after.find('}')?;
+            out.push_str(self.get(&after[..end])?);
+            rest = &after[end + 1..];
+        }
+        out.push_str(rest);
+        Some(out)
+    }
+
+    /// [`Self::substitute`] over a list; `None` if any entry has an unresolved
+    /// placeholder.
+    fn substitute_all(&self, templates: &[String]) -> Option<Vec<String>> {
+        templates.iter().map(|t| self.substitute(t)).collect()
+    }
+
+    /// Every credential name the config references — the union of injection-rule
+    /// keys, agency `requires_key`s, and `{KEY}` placeholders in agency URLs. Used
+    /// only for the startup summary, so a credential present in `keys.env` but unused
+    /// (or referenced but missing) is visible at a glance.
+    fn known_keys(&self) -> Vec<String> {
+        let mut keys = BTreeSet::new();
+        for inj in &self.injections {
+            keys.insert(inj.key.clone());
+        }
+        for agency in &self.agencies {
+            if let Some(key) = &agency.requires_key {
+                keys.insert(key.clone());
+            }
+            let urls = std::iter::once(&agency.static_url)
+                .chain(&agency.extra_static_urls)
+                .chain(&agency.trip_updates_urls)
+                .chain(&agency.vehicle_positions_urls);
+            for url in urls {
+                collect_placeholders(url, &mut keys);
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    /// Print which referenced credentials were found (by name — never the value).
     fn log_summary(&self, path: &str) {
-        let present: Vec<&str> = KNOWN_KEYS
-            .iter()
-            .copied()
-            .filter(|k| self.has(k))
-            .collect();
+        let known = self.known_keys();
+        let present: Vec<&String> = known.iter().filter(|k| self.has(k)).collect();
         if present.is_empty() {
-            println!(
-                "Feed auth: no credentials loaded from {path} (gated feeds will be skipped)"
-            );
+            println!("Feed auth: no credentials loaded from {path} (gated feeds will be skipped)");
         } else {
             println!(
                 "Feed auth: loaded {} credential(s) from {path}: {}",
                 present.len(),
-                present.join(", ")
+                present
+                    .iter()
+                    .map(|s| s.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             );
-            let missing: Vec<&str> = KNOWN_KEYS
-                .iter()
-                .copied()
-                .filter(|k| !self.has(k))
-                .collect();
+            let missing: Vec<&String> = known.iter().filter(|k| !self.has(k)).collect();
             if !missing.is_empty() {
-                println!("Feed auth: no value for: {}", missing.join(", "));
+                println!(
+                    "Feed auth: no value for: {}",
+                    missing
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
             }
         }
+    }
+}
+
+/// Load and parse `auth.json`. A missing file yields an empty config (no rules, no
+/// hand-configured agencies); a malformed file is logged and likewise treated as
+/// empty, so a JSON typo degrades gracefully rather than aborting startup.
+fn load_config(path: &Path) -> AuthConfig {
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(err) => {
+            println!(
+                "Feed auth: no rules loaded from {} ({err}) — auth injections and \
+                 hand-configured feeds disabled",
+                path.display()
+            );
+            return AuthConfig::default();
+        }
+    };
+    match serde_json::from_str(&contents) {
+        Ok(config) => config,
+        Err(err) => {
+            eprintln!(
+                "Feed auth: {} is malformed ({err}) — auth injections and \
+                 hand-configured feeds disabled",
+                path.display()
+            );
+            AuthConfig::default()
+        }
+    }
+}
+
+/// Add every `{KEY}` placeholder name in `template` to `keys`.
+fn collect_placeholders(template: &str, keys: &mut BTreeSet<String>) {
+    let mut rest = template;
+    while let Some(start) = rest.find('{') {
+        let after = &rest[start + 1..];
+        let Some(end) = after.find('}') else { break };
+        keys.insert(after[..end].to_string());
+        rest = &after[end + 1..];
     }
 }
 
@@ -243,115 +396,4 @@ fn url_has_host(url: &str, host: &str) -> bool {
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     let hostname = host_port.split(':').next().unwrap_or(host_port);
     hostname == host || hostname.ends_with(&format!(".{host}"))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn auth_with(pairs: &[(&str, &str)]) -> FeedAuth {
-        FeedAuth::from_secrets(
-            pairs
-                .iter()
-                .map(|(k, v)| (k.to_string(), v.to_string()))
-                .collect(),
-        )
-    }
-
-    #[test]
-    fn injects_header_credential() {
-        let auth = auth_with(&[(STM_API_KEY, "SECRET_STM")]);
-        let client = reqwest::Client::new();
-        let url = "https://api.stm.info/pub/od/gtfs-rt/ic/v2/tripUpdates";
-        let req = auth.apply(&client, url).build().unwrap();
-        assert_eq!(req.headers().get("apiKey").unwrap(), "SECRET_STM");
-    }
-
-    #[test]
-    fn injects_query_credential() {
-        let auth = auth_with(&[(MTA_BUSTIME_KEY, "SECRET_MTA")]);
-        let client = reqwest::Client::new();
-        let url = "https://gtfsrt.prod.obanyc.com/tripUpdates";
-        let req = auth.apply(&client, url).build().unwrap();
-        assert_eq!(
-            req.url().query_pairs().find(|(k, _)| k == "key").unwrap().1,
-            "SECRET_MTA"
-        );
-    }
-
-    #[test]
-    fn leaves_unknown_and_unconfigured_hosts_untouched() {
-        // Known host but no secret configured, and an entirely unknown host.
-        let auth = auth_with(&[]);
-        let client = reqwest::Client::new();
-        for url in [
-            "https://api.stm.info/x",
-            "https://example.com/gtfs-rt/tripUpdates",
-        ] {
-            let req = auth.apply(&client, url).build().unwrap();
-            assert!(req.headers().get("apiKey").is_none());
-            assert!(req.url().query().is_none());
-        }
-    }
-
-    #[test]
-    fn host_matching_is_authority_only() {
-        assert!(url_has_host("https://api.stm.info/x?y=1", "api.stm.info"));
-        assert!(url_has_host("https://sub.api.stm.info/x", "api.stm.info"));
-        // A host that only appears in the path must not match.
-        assert!(!url_has_host("https://evil.example/api.stm.info", "api.stm.info"));
-        // A different host that merely ends with a similar string must not match.
-        assert!(!url_has_host("https://notapi.stm.info.evil.com/x", "api.stm.info"));
-    }
-
-    #[test]
-    fn env_file_parsing() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!("amd_keys_test_{}.env", std::process::id()));
-        std::fs::write(
-            &path,
-            "# a comment\n\nSTM_API_KEY = abc123 \nQUOTED=\"v a l\"\nEMPTY=\n",
-        )
-        .unwrap();
-        let map = read_env_file(&path);
-        std::fs::remove_file(&path).ok();
-        assert_eq!(map.get("STM_API_KEY").unwrap(), "abc123");
-        assert_eq!(map.get("QUOTED").unwrap(), "v a l");
-        assert_eq!(map.get("EMPTY").unwrap(), "");
-    }
-
-    /// Live end-to-end check that every hand-configured feed authenticates and
-    /// decodes. Ignored by default (hits the network and needs a real `keys.env`);
-    /// run with `cargo test -- --ignored --nocapture` after setting `AMD_KEYS_FILE`.
-    #[tokio::test]
-    #[ignore = "hits live agency feeds; needs keys.env (set AMD_KEYS_FILE)"]
-    async fn live_feeds_authenticate() {
-        let auth = FeedAuth::load();
-        let client = reqwest::Client::builder()
-            .user_agent("AmericasMostDelayed/1.0 (auth test)")
-            .build()
-            .unwrap();
-        let configs = crate::agency::authed_agencies(&auth);
-        assert!(
-            !configs.is_empty(),
-            "no hand-configured agencies built — is keys.env present and populated?"
-        );
-        let mut failures = Vec::new();
-        for config in &configs {
-            for url in &config.realtime_urls.trip_updates_url {
-                match crate::realtime::fetch_feed(&client, &auth, url).await {
-                    Ok(feed) => println!(
-                        "OK   [{}] {url} -> {} entities",
-                        config.display_name,
-                        feed.entity.len()
-                    ),
-                    Err(err) => {
-                        println!("FAIL [{}] {url}: {err:#}", config.display_name);
-                        failures.push(format!("{}: {url}", config.display_name));
-                    }
-                }
-            }
-        }
-        assert!(failures.is_empty(), "feeds that failed to authenticate/decode: {failures:#?}");
-    }
 }

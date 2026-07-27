@@ -1,0 +1,16 @@
+# Scrape config for the AMD dev stack. The server exposes OpenMetrics at /metrics
+# (see src/metrics.rs); one scrape every 15s is plenty — this is the operator's own
+# Prometheus, not the egress-sensitive public API.
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+scrape_configs:
+  - job_name: amd-server
+    metrics_path: /metrics
+    static_configs:
+      - targets: ["server:8080"]
+
+  - job_name: prometheus
+    static_configs:
+      - targets: ["localhost:9090"]
