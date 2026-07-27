@@ -222,8 +222,8 @@ struct ShapeResponse {
     polyline: String,
 }
 
-/// A debug-capture request from the leaderboard page's per-row 🐛 button (only
-/// shown when `AMD_DEBUG` is set): which entry, plus the operator's note.
+/// A debug-capture request from the leaderboard page's 🐛 button (only shown when
+/// `AMD_DEBUG` is set): which entry, plus the operator's note.
 #[derive(Deserialize)]
 struct CaptureRequest {
     slug: String,

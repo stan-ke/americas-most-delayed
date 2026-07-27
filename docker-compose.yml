@@ -2,15 +2,19 @@
 #
 # Brings up the four moving parts locally:
 #   server     — the Rust API (built from ./server/Dockerfile), on :8080
-#   static     — the GitHub-Pages half, served by nginx on :3000
+#   static     — the GitHub-Pages half (Vite + SolidJS), built and served by
+#                nginx from ./static/Dockerfile, on :3000
 #   prometheus — scrapes the server's /metrics, on :9090
 #   grafana    — dashboards over Prometheus, on :3001
 #
 # This is NOT the production deployment (see static/README.md). In prod the two
 # halves live on different hosts; here they share a Docker network so Prometheus can
-# reach the server by name. The browser, however, is outside that network: config.js
-# points the static page at http://localhost:8080, which is why the server's port is
-# published to the host.
+# reach the server by name. The browser, however, is outside that network: the page
+# aims itself at http://localhost:8080 when it's loaded from localhost, which is why
+# the server's port is published to the host.
+#
+# The pages are a build now, not files on disk — for the edit/refresh loop use
+# `npm run dev` in ./static instead of this service (see static/README.md).
 #
 #   docker compose up --build
 #
@@ -58,14 +62,14 @@ services:
         max-file: "3"
 
   static:
-    image: nginx:alpine
+    build:
+      context: ./static
+      dockerfile: Dockerfile
+      args:
+        VITE_AMD_API: ""
+    image: amd-static:dev
     ports:
       - "3000:80"
-    volumes:
-      # The GitHub-Pages root, served as-is. config.js already retargets itself at
-      # http://localhost:8080 when the page is loaded from localhost, so no build
-      # step or env wiring is needed for local use.
-      - ./static:/usr/share/nginx/html:ro
     depends_on:
       - server
     restart: unless-stopped

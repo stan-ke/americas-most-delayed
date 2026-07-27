@@ -28,15 +28,16 @@ halves" below, and `../static/README.md` for deployment.
   serving the API on `:8080`. A background census downloads every agency's static
   GTFS zip once into `./feeds/` (git-ignored) to count its trips, so the first run
   pulls a lot over the network; cached zips are reused until they age past 24h.
-- Debug capture: `AMD_DEBUG=1 cargo run` adds a per-row 🐛 button to the
-  leaderboard page that zips one entry's full data (config, live GTFS-RT, static
-  GTFS, computed delay) into `./debug/` (git-ignored) for offline debugging. See
-  the API/frontend section.
+- Debug capture: `AMD_DEBUG=1 cargo run` adds a 🐛 button to the leaderboard page
+  that zips the on-screen entry's full data (config, live GTFS-RT, static GTFS,
+  computed delay) into `./debug/` (git-ignored) for offline debugging. See the
+  API/frontend section.
 - Lint / format: `cargo clippy`, `cargo fmt`
 
-- The pages: serve `../static/` with any static file server (`python3 -m http.server
-  3000`). `config.js` points itself at `http://localhost:8080` when the page is
-  served from localhost, so a local `cargo run` is all it needs.
+- The pages: `cd ../static && npm install && npm run dev` (Vite, on :3000, with hot
+  reload). The page aims itself at `http://localhost:8080` when it's served from
+  localhost, so a local `cargo run` is all it needs. `npm run build` /
+  `npm run typecheck` there too.
 
 
 Note when running under a wrapper: `cargo run` spawns the `server` binary as a
@@ -320,8 +321,14 @@ This is where the "big picture" lives; understanding it requires reading
   (auth-gated, never polled), `NoRealtime` (a static-only feed with no realtime to
   poll — see below), `NoVehiclePositions` (has trip updates but no vehicle-positions
   feed to verify routes against, so excluded), or `Failed(status)`. A poll that returns a `FATAL_STATUSES`
-  code (401/404) retires the source: state → `Failed`, board cleared, and its task
-  ends (never rescheduled). But a feed that merges **several trip-updates URLs**
+  code (401/404) retires the source: state → `Failed`, board cleared, positions and
+  delay history dropped. Its task doesn't end, though — it falls back to
+  `FAILED_RETRY_INTERVAL` (20 min) and keeps knocking, because a 401/404 isn't
+  reliably permanent (a key gets provisioned, a gateway briefly 404s everything) and
+  a source retired for good is one we'd never see come back. A retry that succeeds
+  puts the state back to `Active` (in `record_success`) and normal backoff resumes;
+  a retry that fails again neither re-logs nor re-counts
+  `amd_source_retirements_total`, which stays one-per-retirement. But a feed that merges **several trip-updates URLs**
   (Puget Sound polls one per OBA agency, MTA subway one per line) tolerates a
   per-URL failure: `fetch_delayed_trips` logs a failed sub-feed and presses on with
   whatever answered, propagating an error (and so risking retirement) only when
@@ -367,11 +374,14 @@ is drawn at exactly that line: anything that never changes is served by the free
 half, and the paid half serves only what can't be precomputed — the live board,
 source health, a route shape.
 
-`../static/` (a sibling of `server/`, and the GitHub Pages root) holds
-`index.html`, `status.html`, and `config.js` — the one file that changes at deploy
-time, holding the API origin. There is **no build step** and nothing is
-`include_str!`-baked into the binary any more: the server serves no HTML at all,
-only `/api/*`, so `/` and `/status` are 404s. Because the pages come from a
+`../static/` (a sibling of `server/`) is a **SolidJS + Vite + TypeScript** app with
+two entries — `index.html` (the leaderboard) and `status.html` — sharing the wire
+types and formatters under `src/lib/`. The one thing that changes at deploy time is
+the API origin, and it's a **build-time variable** (`VITE_AMD_API`, read in
+`src/lib/api.ts`, set by `.github/workflows/static.yml`), not a config file
+rewritten in place. `npm run build` emits `static/dist/`, which is what goes to
+Pages. Nothing is `include_str!`-baked into the binary: the server serves no HTML at
+all, only `/api/*`, so `/` and `/status` are 404s. Because the pages come from a
 different origin, `api.rs` mounts a `CorsLayer` (any origin — nothing we serve is
 private) and a `CompressionLayer` (br/gzip). See `../static/README.md` for the
 deploy steps; the API must be **https**, or the browser blocks the calls as mixed
@@ -494,38 +504,78 @@ A thin axum server over the shared `Arc<Scheduler>`. No pages, five data endpoin
   state at scrape time. Also `GET /healthz` — 200/503 liveness from
   `Scheduler::health` (the poll loop is turning), cheap enough to poll often.
 
-The two HTML pages are plain vanilla-JS, no build step. The leaderboard page renders
-the merged board as three stacked sections — the **#1 row**, a **Leaflet map** of one
-delayed vehicle (using the snapshot's `latitude`/`longitude`), then the
-**#2–25 rows**. **Up/down buttons** above the map step a *selected index* through
-the leaderboard, so the map + detail line can show any ranked trip, not just #1
-(the selection is clamped to the current board and persists across the 15s
-pushes). The map re-centers its single marker on each tick and draws the
-selected vehicle's **route line**, fetched on demand from
+The two pages are **SolidJS components** (`../static/src/{leaderboard,status}/`), built
+by Vite. Solid earns its place here because both pages are delta-merged mirrors of
+server state: a tick updates the few rows that changed and nothing else re-renders,
+which is the same discipline `wire.rs` enforces on the wire. The leaderboard page is **one
+trip at a time, full screen, on rotation** — not a table. It shows a single entry as
+a card and auto-advances to the next every `ROTATE_MS` (12s, overridable per-load
+with `?rotate=<seconds>` for a wall display), wrapping at the end of the board. The
+card's hierarchy is fixed and deliberate: **rank → the delay, set huge → the agency →
+route + headsign → the provenance sentence → a small-print `dl`** (next stop, vehicle,
+watched, delay source, feed slug), beside a **Leaflet map** of that vehicle. Two
+formatters keep that split honest — an exact one for the readout (`fmtDelay`, "1h 12m
+30s") and a coarse one for prose and the hero (`fmtSpan`, "1h 12m"), since seconds in
+a sentence are noise and seconds in the biggest type on the page would churn it every
+tick.
+
+Rotation is driven by **`requestAnimationFrame`, not `setTimeout`**, for three
+properties at once: the progress bar stays exactly in step with the countdown,
+pausing is just "stop accumulating", and a **hidden tab stops rotating entirely**
+(rAF doesn't fire there), so a backgrounded display doesn't silently race through the
+board. It pauses on the pause control, on space, and **while the pointer is over the
+map** — reading the map means wanting to stay put. `←`/`→` and a **rail of numbered
+chips** in the footer step or jump to any rank; a chip for a finished trip is
+italicised.
+
+The selection is held by **trip identity (`slug`+`trip_id`), not index**: a 15s push
+reorders the board, and a trip must not be yanked off the screen because something
+worse appeared above it. A trip that falls off the board entirely leaves the view
+holding that position. The enter animation only fires when the trip actually changes,
+so a data refresh of the entry already on screen doesn't blink the whole card.
+
+The map draws the selected vehicle's **route line**, fetched on demand from
 `GET /api/shape/{slug}/{trip_id}` → `Gtfs::trip_shape`, which returns the trip's
 **own** `shape_id` (the accurate path for that run), falling back to the
 **canonical** shape for its route + direction only when the trip has no shape of
-its own. Each row's **Watched** column (and the map caption) shows the entry's
-provenance — how long we've tracked the trip and how much of its lateness it picked
-up *while we watched* — from the snapshot's `tracked_seconds` / `birth_delay_seconds`
-(see the delay-provenance section). These are receipts, not a caveat: everything on
-the board has already passed the vetting gate.
+its own. Positions are only fetched for hot feeds, so a lower-ranked entry
+legitimately has no location: the map is then **hidden behind a placeholder that says
+so**, rather than left showing the previous trip's route. The provenance sentence
+("It was **on time** when we first saw it 20m ago, and has lost **2h 0m** since")
+spends the snapshot's `tracked_seconds` / `birth_delay_seconds` (see the
+delay-provenance section) on the site's actual claim, which is why it sits above the
+small print rather than in a tooltip: these are receipts, not a caveat — everything
+on the board has already passed the vetting gate.
 
-A row whose trip has **finished running** carries `ended_at` and renders dimmed and
-italic (`tr.finished`), with "finished 14m ago" in place of a next stop and the map
-caption saying "last seen at" rather than "vehicle at" — its position is frozen at
-the final sighting, not where the bus is now. `ended_at` is a **unix timestamp, not
-an age**, for exactly the reason `SourceStatus.last_poll` is (see `wire.rs`); the page
-derives the age against the message's own `generated_at`, which also keeps a skewed
-browser clock from rendering "finished -3m ago". The **Late** column shows
-`peak_delay_seconds`, so the number on screen is the one the row was ranked on.
+A trip that has **finished running** carries `ended_at`, which puts the page in
+`body.finished`: the delay goes grey, the label reads "behind schedule **when it
+ended**", a "finished 30m ago" tag sits beside the agency, the `dl` leads with
+**Ended** instead of Next stop, and the map caption says "last seen at" rather than
+"vehicle at" — its position is frozen at the final sighting, not where the bus is
+now. `ended_at` is a **unix timestamp, not an age**, for exactly the reason
+`SourceStatus.last_poll` is (see `wire.rs`); the page derives the age against the
+message's own `generated_at`, which also keeps a skewed browser clock from rendering
+"finished -3m ago". The hero delay is `peak_delay_seconds`, so the number on screen
+is the one the entry was ranked on (a live trip whose current reading has since
+recovered says "now reporting …" underneath).
+
+Layout is one screenful at every size, and the breakpoints are load-bearing: wide is
+**detail beside map** with nothing scrolling and the detail block vertically centred
+against the full-height map; **≤900px** stacks to one column with
+`grid-template-rows: auto 1fr`, so spare height goes entirely to the map instead of
+both rows stretching and leaving the detail swimming in gaps; **≤560px** drops the
+keyboard hint and shrinks the hero. On a short, wide window the detail column is what
+gives — it scrolls inside its own column (`#detail { overflow-y: auto }`) rather than
+pushing the footer off-screen, and under `max-height: 520px` the provenance sentence
+is dropped.
 
 **Debug mode** (`AMD_DEBUG` env var — any value but empty/`0`/`false`/`no`; a
 runtime flag, not a build flag, so it costs a single bool check when off and no
-work until a capture is triggered) surfaces two per-row columns on the leaderboard
-page: 🧮 **score** and 🐛 **capture**.
+work until a capture is triggered) reveals two buttons in the leaderboard page's
+header — 🧮 **score** and 🐛 **capture** — which act on **whichever trip is currently
+on screen** (the rotation is the selector, so pause first, or click its rail chip).
 
-🧮 opens a dialog showing how the row's rank was computed — every factor with its
+🧮 opens a dialog showing how the entry's rank was computed — every factor with its
 value and the inputs that produced it (`score_breakdown`, built by
 `ScoreInputs::breakdown`). It's the audit trail for a ranking that is otherwise
 deliberately hidden. The field is `skip_serializing_if = "Option::is_none"` and only
@@ -556,11 +606,14 @@ on-leaderboard, one-shot blink = freshly polled, custom hover tooltip) and a
 **sortable table** of the same data (click a column header; only the status cell is
 tinted). The LED grid is kept in the **same order as the table**, so re-sorting the
 table re-sorts the dots. Three of its columns (`status`, `age`, `hot`) are *derived*
-client-side rather than sent — `age` most of all, see the `wire.rs` section. Edit
-the pages under `../static/`; there's nothing to rebuild. Note: the leaderboard map
-is the one place we load **external resources** (Leaflet + OpenStreetMap tiles from
-a CDN — someone else's bandwidth, deliberately); the status page stays
-self-contained.
+client-side rather than sent — `age` most of all, see the `wire.rs` section. Its
+~500 sources live in a Solid **store** keyed by slug, so a 2s tick that touches a
+handful of rows updates exactly those dots and cells; the row proxies keep a stable
+identity per slug, which is what lets a re-sort *move* the existing dots rather than
+rebuild them (a rebuild would restart every blink). Note: the leaderboard map is the
+one place we load an **external resource** at runtime — OpenStreetMap tiles, someone
+else's bandwidth, deliberately. Leaflet itself is an npm dependency and bundled now
+(bytes served from Pages are free); the status page stays self-contained.
 
 The serializable public types (`LeaderboardSnapshot`, `StatusReport`, etc.) live
 in `scheduler.rs` so the scheduler stays the single source of truth; `api.rs` only

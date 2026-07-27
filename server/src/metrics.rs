@@ -141,7 +141,9 @@ pub struct Metrics {
     // ---- Counters (incremented at the event). ----
     /// `amd_polls_total{result}` — poll attempts by outcome.
     polls: Family<ResultLabel, Counter>,
-    /// `amd_source_retirements_total` — sources disabled after a fatal HTTP status.
+    /// `amd_source_retirements_total` — sources dropped out of the poll rotation
+    /// after a fatal HTTP status. Counted once per retirement, not once per failed
+    /// retry, so a source that flaps counts each time it goes down.
     source_retirements: Counter,
     /// `amd_trips_vetted_out_total` — late trips the provenance gate refused to
     /// vouch for (see [`crate::history`]).
@@ -203,7 +205,7 @@ impl Metrics {
         let source_retirements = Counter::default();
         registry.register(
             "source_retirements",
-            "Sources disabled after a fatal HTTP status (401/404)",
+            "Sources dropped from the poll rotation after a fatal HTTP status (401/404)",
             source_retirements.clone(),
         );
 

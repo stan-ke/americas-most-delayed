@@ -1,0 +1,466 @@
+/* One trip at a time, full screen, rotating. The visual language is the same
+   plain one the rest of the site uses — system font, hairline rules, one red —
+   so the only thing doing the shouting is the delay itself. */
+:root {
+	--line: #ccc;
+	--rule: #e4e4e4;
+	--muted: #666;
+	--dim: #999;
+	--accent: #d33;
+	--wash: #fff6f4;
+}
+* {
+	box-sizing: border-box;
+}
+html,
+body {
+	height: 100%;
+}
+body {
+	font-family: system-ui, sans-serif;
+	margin: 0;
+	background: #fff;
+	color: #111;
+}
+/* The app mounts into #root, so it — not <body> — is the column the layout hangs
+   off. Everything below still keys off body classes (`empty`, `finished`,
+   `debug-on`), which are page-wide state rather than layout. */
+#root {
+	display: flex;
+	flex-direction: column;
+	height: 100%;
+}
+a {
+	color: inherit;
+}
+
+/* --- header ---------------------------------------------------------- */
+header {
+	display: flex;
+	flex-wrap: wrap;
+	align-items: baseline;
+	gap: 0.4rem 1rem;
+	padding: 0.55rem 1.25rem;
+	border-bottom: 1px solid var(--line);
+}
+header h1 {
+	font-size: 1rem;
+	margin: 0;
+	letter-spacing: 0.01em;
+}
+header .sep {
+	color: var(--dim);
+}
+#meta {
+	font-size: 0.82rem;
+	color: var(--muted);
+	margin-left: auto;
+}
+
+/* Rotation progress. A hairline that fills over one dwell, so the next trip
+   is never a surprise. */
+#progress {
+	height: 2px;
+	background: var(--rule);
+}
+#progress > div {
+	height: 100%;
+	width: 0;
+	background: var(--accent);
+}
+
+/* --- the card -------------------------------------------------------- */
+main {
+	/* min-height: 0 so the panes may shrink below their content — a flex item
+     defaults to refusing that, which would push the footer off-screen. */
+	flex: 1;
+	min-height: 0;
+	display: grid;
+	grid-template-columns: minmax(0, 5fr) minmax(0, 6fr);
+	gap: 1.75rem;
+	padding: 1.25rem 1.25rem 1rem;
+}
+.pane {
+	display: flex;
+	flex-direction: column;
+	min-height: 0;
+	min-width: 0;
+}
+/* Centre the detail block against the full-height map rather than letting it
+   hang from the top of a tall screen. `safe` so an overflowing column pins to
+   the top and stays scrollable instead of clipping its own hero — on a short,
+   wide window (a laptop with a lot of chrome) the detail is what has to give,
+   and it scrolls inside its column rather than shoving the footer off-screen. */
+#detail {
+	justify-content: safe center;
+	overflow-y: auto;
+}
+
+/* rank + delay: the hero, and the only thing sized to be read across a room */
+.rank {
+	font-size: 0.82rem;
+	color: var(--muted);
+	letter-spacing: 0.08em;
+	text-transform: uppercase;
+}
+.rank b {
+	color: var(--accent);
+	font-size: 1.5rem;
+	letter-spacing: 0;
+	text-transform: none;
+	vertical-align: -0.1em;
+}
+.delay {
+	font-size: clamp(3rem, 9vw, 6.5rem);
+	line-height: 1.02;
+	font-weight: 700;
+	letter-spacing: -0.03em;
+	margin: 0.15rem 0 0.1rem;
+	color: var(--accent);
+	font-variant-numeric: tabular-nums;
+}
+.delay .u {
+	font-size: 0.42em;
+	font-weight: 600;
+	letter-spacing: 0;
+	color: var(--dim);
+	margin: 0 0.35em 0 0.04em;
+}
+.delay .u:last-child {
+	margin-right: 0;
+}
+.late-label {
+	font-size: 0.95rem;
+	color: var(--muted);
+	margin: 0 0 1.1rem;
+}
+.late-label .re {
+	color: var(--dim);
+}
+
+/* who it is */
+.agency {
+	font-size: clamp(1.3rem, 2.6vw, 1.9rem);
+	font-weight: 600;
+	margin: 0;
+	line-height: 1.15;
+}
+.route {
+	font-size: 1.05rem;
+	margin: 0.3rem 0 0;
+	color: #333;
+}
+.route .badge {
+	display: inline-block;
+	border: 1px solid var(--line);
+	background: var(--wash);
+	padding: 0.05rem 0.45rem;
+	font-weight: 600;
+	margin-right: 0.4rem;
+}
+.route .to {
+	color: var(--dim);
+	margin: 0 0.35rem;
+}
+
+/* the receipts — why this number is believable at all */
+.prov {
+	margin: 1.1rem 0 0;
+	padding: 0.6rem 0.75rem;
+	border-left: 3px solid var(--line);
+	background: #fafafa;
+	font-size: 0.92rem;
+	color: #333;
+	line-height: 1.45;
+}
+.prov b {
+	font-weight: 600;
+}
+
+/* the small print */
+dl {
+	display: grid;
+	grid-template-columns: max-content minmax(0, 1fr);
+	gap: 0 1.25rem;
+	margin: 1.1rem 0 0;
+	font-size: 0.9rem;
+}
+dt {
+	color: var(--muted);
+	padding: 0.3rem 0;
+	border-top: 1px solid var(--rule);
+}
+dd {
+	margin: 0;
+	padding: 0.3rem 0;
+	border-top: 1px solid var(--rule);
+	overflow-wrap: anywhere;
+}
+dl > dt:first-of-type,
+dl > dt:first-of-type + dd {
+	border-top: none;
+}
+
+/* --- map ------------------------------------------------------------- */
+#map {
+	flex: 1;
+	min-height: 240px;
+	border: 1px solid var(--line);
+	background: #eee;
+}
+#map.hidden {
+	display: none;
+}
+#nomap {
+	flex: 1;
+	min-height: 240px;
+	border: 1px solid var(--line);
+	background: #fafafa;
+	display: none;
+	align-items: center;
+	justify-content: center;
+	text-align: center;
+	color: var(--muted);
+	font-size: 0.92rem;
+	padding: 1rem;
+}
+#nomap.on {
+	display: flex;
+}
+#mapcap {
+	font-size: 0.82rem;
+	color: var(--muted);
+	margin: 0.4rem 0 0;
+}
+.bus-icon {
+	font-size: 24px;
+	line-height: 28px;
+	text-align: center;
+	background: none;
+	border: none;
+	filter: drop-shadow(0 1px 1px rgba(0, 0, 0, 0.4));
+}
+
+/* --- a finished trip -------------------------------------------------- */
+/* It keeps its place on the board and fades out over 24h, so it has to read as
+   a memory rather than as something happening right now. */
+body.finished .delay {
+	color: #777;
+}
+body.finished .route .badge {
+	background: #f4f4f4;
+}
+.ended-tag {
+	display: inline-block;
+	border: 1px solid var(--line);
+	background: #f4f4f4;
+	color: var(--muted);
+	font-size: 0.72rem;
+	letter-spacing: 0.07em;
+	text-transform: uppercase;
+	padding: 0.1rem 0.4rem;
+	vertical-align: 0.25em;
+	margin-left: 0.5rem;
+}
+
+/* --- footer: the rest of the board ----------------------------------- */
+footer {
+	border-top: 1px solid var(--line);
+	padding: 0.5rem 1.25rem;
+	display: flex;
+	align-items: center;
+	gap: 0.5rem;
+}
+footer button {
+	font: inherit;
+	cursor: pointer;
+	background: #fff;
+	border: 1px solid var(--line);
+	padding: 0.15rem 0.5rem;
+}
+/* Fixed width so toggling pause/resume doesn't shove the rail sideways. */
+#pause {
+	min-width: 4.6rem;
+	font-size: 0.85rem;
+	color: var(--muted);
+}
+footer button:disabled {
+	opacity: 0.4;
+	cursor: default;
+}
+#rail {
+	display: flex;
+	gap: 0.25rem;
+	overflow-x: auto;
+	flex: 1;
+	scrollbar-width: thin;
+	padding-bottom: 2px;
+}
+#rail button {
+	min-width: 2rem;
+	font-size: 0.8rem;
+	font-variant-numeric: tabular-nums;
+	color: var(--muted);
+	flex: none;
+}
+#rail button.on {
+	background: var(--accent);
+	border-color: var(--accent);
+	color: #fff;
+	font-weight: 600;
+}
+#rail button.done {
+	font-style: italic;
+	color: var(--dim);
+}
+#rail button.on.done {
+	color: #fff;
+}
+.hint {
+	font-size: 0.78rem;
+	color: var(--dim);
+	white-space: nowrap;
+}
+
+/* --- empty / disconnected -------------------------------------------- */
+#empty {
+	display: none;
+	flex: 1;
+	align-items: center;
+	justify-content: center;
+	color: var(--muted);
+	padding: 2rem;
+	text-align: center;
+}
+body.empty main {
+	display: none;
+}
+body.empty #empty {
+	display: flex;
+}
+
+/* --- debug (AMD_DEBUG only) ------------------------------------------ */
+.dbg {
+	display: none;
+}
+body.debug-on .dbg {
+	display: inline-block;
+}
+.dbg-btn {
+	cursor: pointer;
+	border: 1px solid var(--line);
+	background: #fff;
+	font-size: 0.95rem;
+	padding: 0.05rem 0.35rem;
+}
+#dbgstatus {
+	font-size: 0.8rem;
+	color: var(--muted);
+}
+#scorebox {
+	border: 1px solid #999;
+	border-radius: 6px;
+	padding: 0;
+	max-width: 46rem;
+}
+#scorebox::backdrop {
+	background: rgba(0, 0, 0, 0.35);
+}
+#scorebox .inner {
+	padding: 1rem 1.25rem;
+}
+#scorebox h3 {
+	margin: 0 0 0.5rem;
+	font-size: 1rem;
+}
+#scorebox table {
+	font-size: 0.85rem;
+	border-collapse: collapse;
+	width: 100%;
+}
+#scorebox td {
+	border: 1px solid var(--line);
+	padding: 4px 8px;
+}
+#scorebox td.num {
+	text-align: right;
+	font-variant-numeric: tabular-nums;
+	white-space: nowrap;
+}
+#scorebox .detail {
+	color: var(--muted);
+	font-size: 0.8rem;
+}
+#scorebox .total td {
+	font-weight: 700;
+	background: #f2f2f2;
+}
+#scorebox .close {
+	margin-top: 0.75rem;
+	font: inherit;
+	padding: 0.25rem 0.9rem;
+	cursor: pointer;
+}
+
+/* --- responsive ------------------------------------------------------ */
+/* Wide: detail beside map, one screenful, nothing scrolls. Narrow: one
+   column, detail first, and let the page scroll — a phone can't hold both. */
+@media (max-width: 900px) {
+	/* Stacked, the card can outgrow the screen, so the page has to be allowed to
+     scroll — but it still fills the viewport first. `auto 1fr` puts the spare
+     height entirely into the map rather than letting both rows stretch and
+     leaving the detail block swimming in its own gaps. */
+	main {
+		grid-template-columns: 1fr;
+		grid-template-rows: auto 1fr;
+		gap: 1.25rem;
+		padding: 1rem;
+	}
+	html,
+	body {
+		height: auto;
+	}
+	#root {
+		height: auto;
+		min-height: 100dvh;
+	}
+	#map,
+	#nomap {
+		min-height: 46vw;
+	}
+	.prov {
+		margin-top: 0.9rem;
+	}
+}
+@media (max-width: 560px) {
+	header {
+		padding: 0.5rem 0.8rem;
+	}
+	#meta {
+		margin-left: 0;
+		width: 100%;
+	}
+	main {
+		padding: 0.8rem;
+	}
+	footer {
+		padding: 0.5rem 0.8rem;
+		flex-wrap: wrap;
+	}
+	.hint {
+		display: none;
+	}
+	.delay {
+		font-size: clamp(2.6rem, 15vw, 4rem);
+	}
+}
+/* Tall and narrow (a phone in portrait) still gets the map; short and wide
+   (a laptop) shouldn't have the map squeezed to nothing. */
+@media (max-height: 520px) and (min-width: 901px) {
+	.prov {
+		display: none;
+	}
+	main {
+		padding-top: 0.75rem;
+	}
+}

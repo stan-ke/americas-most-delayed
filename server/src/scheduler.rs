@@ -46,9 +46,18 @@ use crate::wire::DeltaStream;
 /// buffered deltas, so this only needs to absorb brief bursts.
 const UPDATE_BUFFER: usize = 64;
 
-/// HTTP statuses that mark a source as permanently broken: unauthorized (`401`)
-/// or gone (`404`). We stop polling a source the first time it returns one.
+/// HTTP statuses that mark a source as broken: unauthorized (`401`) or gone
+/// (`404`). We take a source out of the normal rotation the first time it returns
+/// one — but not forever, see [`FAILED_RETRY_INTERVAL`].
 const FATAL_STATUSES: [u16; 2] = [401, 404];
+/// How often a [`SourceState::Failed`] source is retried. A 401/404 is usually
+/// permanent, but not always — a key gets provisioned, a feed moves back, an
+/// agency's gateway briefly answers 404 for everything — and a source retired for
+/// good is one we'd never notice coming back. Slow enough (20 min) that a few
+/// hundred dead feeds cost a negligible trickle of requests, and a source that
+/// answers is folded straight back into the rotation by
+/// [`record_success`](Scheduler::record_success).
+const FAILED_RETRY_INTERVAL: Duration = Duration::from_secs(20 * 60);
 
 /// Poll interval for a feed with a vehicle currently on the leaderboard.
 const BASE_INTERVAL: Duration = Duration::from_secs(20);
@@ -196,7 +205,9 @@ enum SourceState {
     /// verify a delayed trip's vehicle is actually on its route. Surfaced in
     /// `/status` but never polled.
     NoVehiclePositions,
-    /// Disabled after the feed returned a [`FATAL_STATUSES`] code; never retried.
+    /// Out of the normal rotation after the feed returned a [`FATAL_STATUSES`]
+    /// code. Retried every [`FAILED_RETRY_INTERVAL`]; a poll that succeeds puts
+    /// the source back to `Active`.
     Failed(u16),
 }
 
@@ -528,22 +539,23 @@ impl Scheduler {
             .collect()
     }
 
-    /// One feed's polling loop: poll, then sleep its current interval, forever —
-    /// until a fatal status retires it. The initial `stagger` spreads the first
-    /// polls across [`BASE_INTERVAL`] so we don't fire hundreds of requests at
-    /// once.
+    /// One feed's polling loop: poll, then sleep its current interval, forever.
+    /// A fatal status doesn't end the task — it drops the feed to the slow
+    /// [`FAILED_RETRY_INTERVAL`] until it answers again. The initial `stagger`
+    /// spreads the first polls across [`BASE_INTERVAL`] so we don't fire hundreds
+    /// of requests at once.
     async fn run_feed(self: Arc<Self>, idx: usize, stagger: Duration) {
         tokio::time::sleep(stagger).await;
         let mut interval = BASE_INTERVAL;
-        while let Some(next) = self.poll_once(idx, interval).await {
-            interval = next;
+        loop {
+            interval = self.poll_once(idx, interval).await;
             tokio::time::sleep(interval).await;
         }
     }
 
     /// Poll one feed once: update its board and health, and return the interval
-    /// until its next poll — or `None` to retire it (after a fatal status).
-    async fn poll_once(&self, idx: usize, current_interval: Duration) -> Option<Duration> {
+    /// until its next poll.
+    async fn poll_once(&self, idx: usize, current_interval: Duration) -> Duration {
         let config = &self.configs[idx];
 
         // Enrich with the static schedule only if we've already loaded it (which
@@ -585,18 +597,23 @@ impl Scheduler {
             }
             Err(err) => {
                 eprintln!("[{}] poll failed: {err:#}", config.display_name);
-                // A 401/404 means this feed is gone or gated: retire it. Its board
-                // is cleared and its task ends.
+                // A 401/404 means this feed is gone or gated: drop it out of the
+                // rotation. Its board is cleared and everything it contributed is
+                // forgotten, but its task stays alive to retry it slowly — the
+                // status may yet turn out to have been temporary.
                 if let Some(status) = http_status(&err).filter(|s| FATAL_STATUSES.contains(s)) {
-                    eprintln!(
-                        "[{}] disabling source after HTTP {status}",
-                        config.display_name
-                    );
-                    self.record_failure(idx, &err, Some(status));
+                    if self.record_failure(idx, &err, Some(status)) {
+                        eprintln!(
+                            "[{}] disabling source after HTTP {status}; retrying every {}m",
+                            config.display_name,
+                            FAILED_RETRY_INTERVAL.as_secs() / 60
+                        );
+                    }
                     self.boards.lock().unwrap().remove(&idx);
                     self.positions.lock().unwrap().remove(&idx);
                     self.history.forget_source(idx);
-                    return None;
+                    self.status.lock().unwrap()[idx].interval = FAILED_RETRY_INTERVAL;
+                    return FAILED_RETRY_INTERVAL;
                 }
                 self.record_failure(idx, &err, None);
             }
@@ -631,7 +648,7 @@ impl Scheduler {
         let mut status = self.status.lock().unwrap();
         status[idx].hot = hot;
         status[idx].interval = next_interval;
-        Some(next_interval)
+        next_interval
     }
 
     /// Fold a feed's current live board into the [`archive`](Self::archive) — the
@@ -1094,14 +1111,26 @@ impl Scheduler {
         runtime.late_trips = late_trips;
         runtime.vetted_out = vetted_out;
         runtime.peak_vehicles = runtime.peak_vehicles.max(vehicle_count);
+        // A retried source that answers is back in business: return it to the
+        // normal rotation (only `Active` and retrying `Failed` sources poll at
+        // all, so this can't resurrect an auth-gated or realtime-less feed).
+        if let SourceState::Failed(code) = runtime.state {
+            eprintln!(
+                "[{}] recovered from HTTP {code}, back in the rotation",
+                self.configs[idx].display_name
+            );
+            runtime.state = SourceState::Active;
+        }
         drop(status);
         self.metrics.record_poll(true);
         self.metrics.record_vetted_out(vetted_out as u64);
     }
 
     /// Record a failed poll. `fatal` carries the disabling HTTP status when the
-    /// source is being retired.
-    fn record_failure(&self, idx: usize, err: &anyhow::Error, fatal: Option<u16>) {
+    /// source is being taken out of the rotation. Returns whether that status
+    /// *newly* retired the source — a source already `Failed` is just failing its
+    /// periodic retry, which shouldn't re-log or re-count as a retirement.
+    fn record_failure(&self, idx: usize, err: &anyhow::Error, fatal: Option<u16>) -> bool {
         let mut status = self.status.lock().unwrap();
         let runtime = &mut status[idx];
         runtime.last_poll = Some(unix_now());
@@ -1110,15 +1139,17 @@ impl Scheduler {
         runtime.vehicles_now = 0;
         runtime.late_trips = 0;
         runtime.vetted_out = 0;
+        let newly_failed = fatal.is_some() && !matches!(runtime.state, SourceState::Failed(_));
         if let Some(code) = fatal {
             runtime.state = SourceState::Failed(code);
             runtime.hot = false;
         }
         drop(status);
         self.metrics.record_poll(false);
-        if fatal.is_some() {
+        if newly_failed {
             self.metrics.record_retirement();
         }
+        newly_failed
     }
 
     /// Flip a source's "downloading/importing static GTFS" flag for the status
@@ -1920,7 +1951,6 @@ impl Scheduler {
             // Retire trips whose feeds have stopped reporting them and expire the ones
             // that have decayed out, so the board about to be rendered is already aged.
             self.sweep_archive();
-            print_leaderboard(&self.archive.lock().unwrap(), &self.configs, unix_now());
             self.broadcast_update();
         }
     }
@@ -2091,59 +2121,6 @@ fn ranked_records(
         .collect();
     ranked.sort_by(|(a, _, _), (b, _, _)| b.total_cmp(a));
     ranked
-}
-
-/// Print the top-scoring trips across every agency.
-fn print_leaderboard(
-    archive: &HashMap<usize, HashMap<String, TripRecord>>,
-    configs: &[AgencyConfig],
-    now: u64,
-) {
-    let ranked = ranked_records(archive, now);
-
-    println!("\n=== America's Most Delayed ===");
-    if ranked.is_empty() {
-        println!("(no delays reported right now)");
-    }
-    for (rank, (score, idx, record)) in ranked.iter().take(LEADERBOARD_SIZE).enumerate() {
-        let trip = &record.trip;
-        let agency = configs[*idx].display_name.as_str();
-        let headsign = trip
-            .headsign
-            .as_deref()
-            .map(|h| format!(" → {h}"))
-            .unwrap_or_default();
-        println!(
-            "{}. {} — route {}{} — {} late",
-            rank + 1,
-            agency,
-            trip.route,
-            headsign,
-            format_delay(record.peak_delay_seconds),
-        );
-
-        let mut details = Vec::new();
-        // A finished trip is still on the board, fading — say so, so the console
-        // doesn't read as though a bus that arrived an hour ago is still out there.
-        match record.ended_at {
-            Some(ended) => details.push(format!(
-                "finished {} ago",
-                format_delay(now.saturating_sub(ended) as i64)
-            )),
-            None if trip.next_stop.is_some() => {
-                details.push(format!("next stop {}", trip.next_stop.as_deref().unwrap()))
-            }
-            None => {}
-        }
-        if let Some(vehicle) = &trip.vehicle {
-            details.push(format!("bus {vehicle}"));
-        }
-        details.push(format!("trip {}", trip.trip_id));
-        details.push(format!("[{}]", trip.source.label()));
-        details.push(format!("score {score:.1}"));
-        println!("     {}", details.join(" · "));
-    }
-    println!();
 }
 
 /// Render a delay in seconds as e.g. `"1h 12m 30s"`.

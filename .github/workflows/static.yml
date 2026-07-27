@@ -1,4 +1,4 @@
-# Simple workflow for deploying static content to GitHub Pages
+# Builds the static half (Vite + SolidJS) and deploys it to GitHub Pages.
 name: Deploy static content to Pages
 
 on:
@@ -28,19 +28,36 @@ jobs:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: static
     steps:
       - name: Checkout
         uses: actions/checkout@v4
       - name: Setup Pages
         uses: actions/configure-pages@v5
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+          cache-dependency-path: static/package-lock.json
+      - name: Install dependencies
+        run: npm ci
+      - name: Typecheck
+        run: npm run typecheck
       - name: Build static content
-        run: |
-          sed -i 's|<api_url>|https://amd-api.stan.ke|g' static/config.js
+        # The API origin is baked in here rather than rewritten in a checked-in
+        # config file after the fact — it's the one thing that changes at deploy
+        # time. See static/src/lib/api.ts.
+        run: npm run build
+        env:
+          VITE_AMD_API: https://amd-api.stan.ke
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # Upload entire repository
-          path: 'static/'
+          # The build output, not the source tree.
+          path: 'static/dist'
       - name: Deploy to GitHub Pages
         id: deployment
         uses: actions/deploy-pages@v5
