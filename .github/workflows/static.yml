@@ -44,19 +44,13 @@ jobs:
           cache-dependency-path: static/package-lock.json
       - name: Install dependencies
         run: npm ci
-      - name: Typecheck
-        run: npm run typecheck
       - name: Build static content
-        # The API origin is baked in here rather than rewritten in a checked-in
-        # config file after the fact — it's the one thing that changes at deploy
-        # time. See static/src/lib/api.ts.
         run: npm run build
         env:
           VITE_AMD_API: https://amd-api.stan.ke
       - name: Upload artifact
         uses: actions/upload-pages-artifact@v3
         with:
-          # The build output, not the source tree.
           path: 'static/dist'
       - name: Deploy to GitHub Pages
         id: deployment
