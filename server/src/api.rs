@@ -73,6 +73,18 @@ fn metrics_bearer_auth() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// Constant-time string equality for auth-token checks.
+fn constant_time_eq(left: &str, right: &str) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    let mut diff = 0u8;
+    for (a, b) in left.bytes().zip(right.bytes()) {
+        diff |= a ^ b;
+    }
+    diff == 0
+}
+
 type Shared = Arc<Scheduler>;
 
 /// Serve the API forever. Blocks until the listener fails.
@@ -129,11 +141,11 @@ async fn healthz(State(scheduler): State<Shared>) -> Response {
 /// time, so they're always fresh without any per-tick bookkeeping.
 async fn metrics(State(scheduler): State<Shared>, headers: HeaderMap) -> Response {
     if let Some(expected) = metrics_bearer_auth() {
-        let expected = "Bearer ".to_string() + &expected;
+        let expected = ["Bearer ", expected.as_str()].concat();
         let authorized = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            == Some(expected.as_str());
+            .is_some_and(|value| constant_time_eq(value, &expected));
         if !authorized {
             return (
                 StatusCode::UNAUTHORIZED,

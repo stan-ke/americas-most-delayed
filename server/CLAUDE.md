@@ -424,8 +424,7 @@ one scrape every 15–60s from one Prometheus is not 500 browser tabs, which is 
 frees it to be comprehensive.
 
 If `METRICS_BEARER_AUTH` is set, `/metrics` requires an `Authorization` header
-containing that exact token value in the standard API-token format; when
-unset/empty, `/metrics` remains open.
+whose token matches that env var; when unset/empty, `/metrics` remains open.
 
 The metrics split into the two kinds that shape the module:
 
