@@ -141,11 +141,11 @@ async fn healthz(State(scheduler): State<Shared>) -> Response {
 /// time, so they're always fresh without any per-tick bookkeeping.
 async fn metrics(State(scheduler): State<Shared>, headers: HeaderMap) -> Response {
     if let Some(expected) = metrics_bearer_auth() {
-        let expected = ["Bearer ", expected.as_str()].concat();
         let authorized = headers
             .get(header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
-            .is_some_and(|value| constant_time_eq(value, &expected));
+            .and_then(|value| value.strip_prefix("Bearer "))
+            .is_some_and(|token| constant_time_eq(token, &expected));
         if !authorized {
             return (
                 StatusCode::UNAUTHORIZED,
