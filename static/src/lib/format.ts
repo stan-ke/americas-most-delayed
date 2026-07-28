@@ -2,27 +2,40 @@
 
 import type { DelaySource, LeaderboardEntry } from "./types";
 
+function padInt(n: number): string {
+	return n.toString().padStart(2, "0");
+}
+
 /** Seconds -> "1h 12m 30s". The exact readout. */
 export function fmtDelay(s: number): string {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  if (h) return `${h}h ${m}m ${sec}s`;
-  if (m) return `${m}m ${sec}s`;
-  return `${sec}s`;
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const sec = padInt(Math.floor(s % 60));
+	if (h) return `${h}h ${padInt(m)}m ${sec}s`;
+	if (m) return `${padInt(m)}m ${sec}s`;
+	return `${sec}s`;
 }
 
 /**
  * The same figure split into number/unit pairs, so the hero can set the units
  * smaller than the digits.
  */
-export function delayParts(s: number): [number, string][] {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const sec = Math.floor(s % 60);
-  if (h) return [[h, "h"], [m, "m"], [sec, "s"]];
-  if (m) return [[m, "m"], [sec, "s"]];
-  return [[sec, "s"]];
+export function delayParts(s: number): [string, string][] {
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	const sec = padInt(Math.floor(s % 60));
+	if (h)
+		return [
+			[String(h), "h"],
+			[padInt(m), "m"],
+			[sec, "s"],
+		];
+	if (m)
+		return [
+			[padInt(m), "m"],
+			[sec, "s"],
+		];
+	return [[sec, "s"]];
 }
 
 /**
@@ -30,11 +43,11 @@ export function delayParts(s: number): [number, string][] {
  * meaningful as they look in a sentence; they belong in the readout below it.
  */
 export function fmtSpan(s: number): string {
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  if (h) return `${h}h ${m}m`;
-  if (s >= 60) return `${m}m`;
-  return `${Math.floor(s)}s`;
+	const h = Math.floor(s / 3600);
+	const m = Math.floor((s % 3600) / 60);
+	if (h) return `${h}h ${m}m`;
+	if (s >= 60) return `${m}m`;
+	return `${Math.floor(s)}s`;
 }
 
 /**
@@ -44,7 +57,7 @@ export function fmtSpan(s: number): string {
  * whatever its last frame happened to say.
  */
 export const peak = (e: LeaderboardEntry): number =>
-  e.peak_delay_seconds ?? e.delay_seconds;
+	e.peak_delay_seconds ?? e.delay_seconds;
 
 /**
  * How much lateness the trip picked up while we watched. Every ranked trip was on
@@ -52,10 +65,12 @@ export const peak = (e: LeaderboardEntry): number =>
  * what makes the number credible rather than a stale trip id from the feed.
  */
 export const growth = (e: LeaderboardEntry): number =>
-  Math.max(peak(e) - e.birth_delay_seconds, 0);
+	Math.max(peak(e) - e.birth_delay_seconds, 0);
 
 export const fmtBirth = (e: LeaderboardEntry): string =>
-  e.birth_delay_seconds > 0 ? `${fmtSpan(e.birth_delay_seconds)} late` : "on time";
+	e.birth_delay_seconds > 0
+		? `${fmtSpan(e.birth_delay_seconds)} late`
+		: "on time";
 
 /**
  * How long ago a finished trip ended, against the *server's* clock.
@@ -66,14 +81,15 @@ export const fmtBirth = (e: LeaderboardEntry): string =>
  * `Date.now()` so a skewed browser clock can't render "finished -3m ago".
  */
 export const endedAgo = (e: LeaderboardEntry, now: number): number | null =>
-  e.ended_at == null ? null : Math.max(now - e.ended_at, 0);
+	e.ended_at == null ? null : Math.max(now - e.ended_at, 0);
 
 /** What names an entry across ticks: the same identity the server keys deltas by. */
-export const tripKey = (e: Pick<LeaderboardEntry, "slug" | "trip_id">): string =>
-  JSON.stringify([e.slug, e.trip_id]);
+export const tripKey = (
+	e: Pick<LeaderboardEntry, "slug" | "trip_id">,
+): string => JSON.stringify([e.slug, e.trip_id]);
 
 export const SOURCE_LABEL: Record<DelaySource, string> = {
-  "trip-level": "agency-reported (trip)",
-  "stop-level": "agency-reported (stop)",
-  "vs-schedule": "compared against the timetable",
+	"trip-level": "agency-reported (trip)",
+	"stop-level": "agency-reported (stop)",
+	"vs-schedule": "compared against the timetable",
 };

@@ -5,13 +5,13 @@ import { createSocket } from "../lib/socket";
 import type { SourceStatus, StatusMessage, StatusSummary } from "../lib/types";
 
 export interface Report {
-  sources: Record<string, SourceStatus>;
-  slugs: Accessor<string[]>;
-  summary: Accessor<StatusSummary | null>;
-  /** The server's clock at the last message — what `age` is derived against. */
-  generatedAt: Accessor<number>;
-  /** Set while the full report is unreachable. */
-  disconnected: Accessor<boolean>;
+	sources: Record<string, SourceStatus>;
+	slugs: Accessor<string[]>;
+	summary: Accessor<StatusSummary | null>;
+	/** The server's clock at the last message — what `age` is derived against. */
+	generatedAt: Accessor<number>;
+	/** Set while the full report is unreachable. */
+	disconnected: Accessor<boolean>;
 }
 
 /**
@@ -35,82 +35,82 @@ export interface Report {
  * without re-rendering (or re-sorting the DOM of) everything else.
  */
 export function createReport(): Report {
-  const [sources, setSources] = createStore<Record<string, SourceStatus>>({});
-  const [summary, setSummary] = createSignal<StatusSummary | null>(null);
-  const [generatedAt, setGeneratedAt] = createSignal(0);
-  const [disconnected, setDisconnected] = createSignal(false);
+	const [sources, setSources] = createStore<Record<string, SourceStatus>>({});
+	const [summary, setSummary] = createSignal<StatusSummary | null>(null);
+	const [generatedAt, setGeneratedAt] = createSignal(0);
+	const [disconnected, setDisconnected] = createSignal(false);
 
-  let seq = -1;
-  let fetching = false;
-  /** Deltas that arrived while the full was in flight. */
-  let queued: StatusMessage[] = [];
+	let seq = -1;
+	let fetching = false;
+	/** Deltas that arrived while the full was in flight. */
+	let queued: StatusMessage[] = [];
 
-  const apply = (message: StatusMessage) => {
-    // Hold deltas until the full they build on has landed, rather than throwing
-    // them away and having to refetch.
-    if (fetching && message.base !== undefined) {
-      queued.push(message);
-      return;
-    }
-    if (message.seq <= seq) return;
-    if (message.base !== undefined && message.base > seq) {
-      void loadFull();
-      return;
-    }
-    if (message.base === undefined) {
-      // A full replaces everything. `reconcile` diffs it against what we hold so
-      // unchanged rows don't churn.
-      const next: Record<string, SourceStatus> = {};
-      for (const row of message.sources) next[row.slug] = row;
-      setSources(reconcile(next));
-    } else {
-      setSources(
-        produce((state) => {
-          for (const row of message.sources) {
-            const existing = state[row.slug];
-            if (existing) Object.assign(existing, row);
-            else state[row.slug] = row;
-          }
-          for (const slug of message.removed ?? []) delete state[slug];
-        }),
-      );
-    }
+	const apply = (message: StatusMessage) => {
+		// Hold deltas until the full they build on has landed, rather than throwing
+		// them away and having to refetch.
+		if (fetching && message.base !== undefined) {
+			queued.push(message);
+			return;
+		}
+		if (message.seq <= seq) return;
+		if (message.base !== undefined && message.base > seq) {
+			void loadFull();
+			return;
+		}
+		if (message.base === undefined) {
+			// A full replaces everything. `reconcile` diffs it against what we hold so
+			// unchanged rows don't churn.
+			const next: Record<string, SourceStatus> = {};
+			for (const row of message.sources) next[row.slug] = row;
+			setSources(reconcile(next));
+		} else {
+			setSources(
+				produce((state) => {
+					for (const row of message.sources) {
+						const existing = state[row.slug];
+						if (existing) Object.assign(existing, row);
+						else state[row.slug] = row;
+					}
+					for (const slug of message.removed ?? []) delete state[slug];
+				}),
+			);
+		}
 
-    seq = message.seq;
-    setSummary(message.summary);
-    setGeneratedAt(message.generated_at);
-    setDisconnected(false);
-  };
+		seq = message.seq;
+		setSummary(message.summary);
+		setGeneratedAt(message.generated_at);
+		setDisconnected(false);
+	};
 
-  const loadFull = async () => {
-    if (fetching) return;
-    fetching = true;
-    try {
-      const report = (await fetch(`${AMD_API}/api/status`).then((r) =>
-        r.json(),
-      )) as StatusMessage;
-      fetching = false;
-      apply(report);
-      // Replay anything that arrived while we were fetching, oldest first.
-      const held = queued.sort((a, b) => a.seq - b.seq);
-      queued = [];
-      for (const message of held) apply(message);
-    } catch {
-      fetching = false;
-      setDisconnected(true);
-    }
-  };
+	const loadFull = async () => {
+		if (fetching) return;
+		fetching = true;
+		try {
+			const report = (await fetch(`${AMD_API}/api/status`).then((r) =>
+				r.json(),
+			)) as StatusMessage;
+			fetching = false;
+			apply(report);
+			// Replay anything that arrived while we were fetching, oldest first.
+			const held = queued.sort((a, b) => a.seq - b.seq);
+			queued = [];
+			for (const message of held) apply(message);
+		} catch {
+			fetching = false;
+			setDisconnected(true);
+		}
+	};
 
-  createSocket({
-    url: `${AMD_WS}/api/status/live`,
-    onOpen: () => void loadFull(),
-    onMessage: (message) => apply(message as StatusMessage),
-    onClose: () => {
-      seq = -1; // whatever we resync to next will be a full
-    },
-  });
+	createSocket({
+		url: `${AMD_WS}/api/status/live`,
+		onOpen: () => void loadFull(),
+		onMessage: (message) => apply(message as StatusMessage),
+		onClose: () => {
+			seq = -1; // whatever we resync to next will be a full
+		},
+	});
 
-  const slugs = createMemo(() => Object.keys(sources));
+	const slugs = createMemo(() => Object.keys(sources));
 
-  return { sources, slugs, summary, generatedAt, disconnected };
+	return { sources, slugs, summary, generatedAt, disconnected };
 }

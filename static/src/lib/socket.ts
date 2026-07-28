@@ -9,34 +9,34 @@ import { onCleanup } from "solid-js";
  * server sends a full to a client that connects fresh.
  */
 export function createSocket(opts: {
-  url: string;
-  onMessage: (message: unknown, socket: WebSocket) => void;
-  onOpen?: (socket: WebSocket) => void;
-  onClose?: () => void;
-  retryMs?: number;
+	url: string;
+	onMessage: (message: unknown, socket: WebSocket) => void;
+	onOpen?: (socket: WebSocket) => void;
+	onClose?: () => void;
+	retryMs?: number;
 }): void {
-  const retryMs = opts.retryMs ?? 2000;
-  let socket: WebSocket | null = null;
-  let retry: ReturnType<typeof setTimeout> | undefined;
-  let disposed = false;
+	const retryMs = opts.retryMs ?? 2000;
+	let socket: WebSocket | null = null;
+	let retry: ReturnType<typeof setTimeout> | undefined;
+	let disposed = false;
 
-  const connect = () => {
-    if (disposed) return;
-    socket = new WebSocket(opts.url);
-    socket.onopen = () => opts.onOpen?.(socket!);
-    socket.onmessage = (ev) => opts.onMessage(JSON.parse(ev.data), socket!);
-    socket.onclose = () => {
-      opts.onClose?.();
-      if (!disposed) retry = setTimeout(connect, retryMs);
-    };
-  };
-  connect();
+	const connect = () => {
+		if (disposed) return;
+		socket = new WebSocket(opts.url);
+		socket.onopen = () => opts.onOpen?.(socket!);
+		socket.onmessage = (ev) => opts.onMessage(JSON.parse(ev.data), socket!);
+		socket.onclose = () => {
+			opts.onClose?.();
+			if (!disposed) retry = setTimeout(connect, retryMs);
+		};
+	};
+	connect();
 
-  onCleanup(() => {
-    disposed = true;
-    clearTimeout(retry);
-    // Drop the handler first: a close we asked for shouldn't schedule a retry.
-    if (socket) socket.onclose = null;
-    socket?.close();
-  });
+	onCleanup(() => {
+		disposed = true;
+		clearTimeout(retry);
+		// Drop the handler first: a close we asked for shouldn't schedule a retry.
+		if (socket) socket.onclose = null;
+		socket?.close();
+	});
 }

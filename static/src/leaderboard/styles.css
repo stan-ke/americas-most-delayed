@@ -97,12 +97,6 @@ main {
 }
 
 /* rank + delay: the hero, and the only thing sized to be read across a room */
-.rank {
-	font-size: 0.82rem;
-	color: var(--muted);
-	letter-spacing: 0.08em;
-	text-transform: uppercase;
-}
 .rank b {
 	color: var(--accent);
 	font-size: 1.5rem;
@@ -161,20 +155,6 @@ main {
 .route .to {
 	color: var(--dim);
 	margin: 0 0.35rem;
-}
-
-/* the receipts — why this number is believable at all */
-.prov {
-	margin: 1.1rem 0 0;
-	padding: 0.6rem 0.75rem;
-	border-left: 3px solid var(--line);
-	background: #fafafa;
-	font-size: 0.92rem;
-	color: #333;
-	line-height: 1.45;
-}
-.prov b {
-	font-weight: 600;
 }
 
 /* the small print */
@@ -428,9 +408,6 @@ body.debug-on .dbg {
 	#nomap {
 		min-height: 46vw;
 	}
-	.prov {
-		margin-top: 0.9rem;
-	}
 }
 @media (max-width: 560px) {
 	header {
@@ -457,9 +434,6 @@ body.debug-on .dbg {
 /* Tall and narrow (a phone in portrait) still gets the map; short and wide
    (a laptop) shouldn't have the map squeezed to nothing. */
 @media (max-height: 520px) and (min-width: 901px) {
-	.prov {
-		display: none;
-	}
 	main {
 		padding-top: 0.75rem;
 	}
