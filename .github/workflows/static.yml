@@ -40,12 +40,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 22
-          cache: npm
-          cache-dependency-path: static/package-lock.json
+      - name: Install pnpm
+        uses: pnpm/action-setup@v4
       - name: Install dependencies
-        run: npm ci
+        run: pnpm ci
       - name: Build static content
-        run: npm run build
+        run: pnpm build
         env:
           VITE_AMD_API: https://amd-api.stan.ke
       - name: Upload artifact
