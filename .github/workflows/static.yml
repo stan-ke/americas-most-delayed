@@ -42,6 +42,8 @@ jobs:
           node-version: 22
       - name: Install pnpm
         uses: pnpm/action-setup@v4
+        with:
+          package_json_file: static/package.json
       - name: Install dependencies
         run: pnpm ci
       - name: Build static content
