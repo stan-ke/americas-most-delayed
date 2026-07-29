@@ -138,6 +138,13 @@ pub struct LeaderboardEntry {
     /// (`GET /api/shape/{slug}/{trip_id}`).
     pub trip_id: String,
     pub route: String,
+    /// What kind of vehicle runs this route — `bus`, `tram`, `subway`, `rail`,
+    /// `ferry`, `cable-tram`, `aerial-lift`, `funicular`, `trolleybus`, `monorail`
+    /// — from the static schedule's `route_type` (see [`gtfs::RouteKind`]). The map
+    /// picks its vehicle icon from this. `null` when the agency's schedule isn't
+    /// loaded or doesn't classify the route; the page then shows a generic vehicle.
+    /// Fixed for the life of a trip, so it costs one field once per row on the wire.
+    pub vehicle_type: Option<&'static str>,
     pub headsign: Option<String>,
     pub next_stop: Option<String>,
     pub vehicle: Option<String>,
@@ -1285,6 +1292,7 @@ impl Scheduler {
                     slug: config.slug.clone(),
                     trip_id: trip.trip_id.clone(),
                     route: trip.route.clone(),
+                    vehicle_type: trip.route_kind.map(gtfs::RouteKind::label),
                     headsign: trip.headsign.clone(),
                     next_stop: trip.next_stop.clone(),
                     vehicle: trip.vehicle.clone(),
@@ -1683,6 +1691,7 @@ impl Scheduler {
             serde_json::json!({
                 "trip_id": t.trip_id,
                 "route": t.route,
+                "vehicle_type": t.route_kind.map(gtfs::RouteKind::label),
                 "delay_seconds": t.delay_seconds,
                 "source": t.source.label(),
                 "headsign": t.headsign,
