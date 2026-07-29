@@ -212,7 +212,7 @@ dl > dt:first-of-type + dd {
 	color: var(--muted);
 	margin: 0.4rem 0 0;
 }
-.bus-icon {
+.vehicle-icon {
 	font-size: 24px;
 	line-height: 28px;
 	text-align: center;

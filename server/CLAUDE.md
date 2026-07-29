@@ -540,7 +540,14 @@ The map draws the selected vehicle's **route line**, fetched on demand from
 **canonical** shape for its route + direction only when the trip has no shape of
 its own. Positions are only fetched for hot feeds, so a lower-ranked entry
 legitimately has no location: the map is then **hidden behind a placeholder that says
-so**, rather than left showing the previous trip's route. The provenance sentence
+so**, rather than left showing the previous trip's route. The marker itself is the
+**vehicle's mode**, not always a bus: the snapshot carries `vehicle_type` (a name —
+`bus`, `tram`, `subway`, `rail`, `ferry`, `trolleybus`… — classified server-side by
+`gtfs::RouteKind` from the route's `route_type`, so the page never re-implements
+GTFS's two numbering schemes), and `TripMap` maps it to an emoji, falling back to the
+bus when it's `null` (a feed whose static schedule isn't loaded, or that doesn't
+classify the route). It's fixed for the life of a trip, so it costs one field once
+per row on the wire. The provenance sentence
 ("It was **on time** when we first saw it 20m ago, and has lost **2h 0m** since")
 spends the snapshot's `tracked_seconds` / `birth_delay_seconds` (see the
 delay-provenance section) on the site's actual claim, which is why it sits above the
@@ -737,10 +744,16 @@ snapshot, and the leaderboard's **Watched** column shows them; `/status` shows
   into prepared inserts (never collecting a whole table), with secondary indexes on
   `stop_times`/`shapes` built after the bulk load; the `time` column bakes in
   arrival-else-departure. The `.sqlite` is **derived from the cached zip** and
-  rebuilt only when the zip is newer (mtime check) or the db is missing — so the
+  rebuilt only when the zip is newer (mtime check), the db is missing, or it was
+  built by an older `SCHEMA_VERSION` — so the
   zip download/refresh/census path is untouched, and a maintenance refresh (which
   re-downloads a newer zip) transparently triggers a rebuild on the next load. The
   zip disk cache is mtime-TTL'd (`STATIC_TTL`, 24h) and written atomically.
+  **Bump `SCHEMA_VERSION` whenever `SCHEMA` or the import changes**: it's stamped
+  into each index's `user_version` and checked before one is reused. Without it an
+  added column reads as missing on every already-cached feed until that feed's zip
+  happens to age past its 24h TTL — a schema change that silently half-applies for
+  a day.
 
   **A 200 OK is not a GTFS zip** (`looks_like_zip`, checked before anything is
   cached). Plenty of agencies answer a zip request with `200` carrying HTML (a login

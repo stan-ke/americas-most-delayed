@@ -2,7 +2,7 @@
 
 use std::collections::HashMap;
 
-use crate::gtfs::{self, Gtfs, Trip};
+use crate::gtfs::{self, Gtfs, RouteKind, Trip};
 use chrono::{NaiveDate, TimeZone, Utc};
 use chrono_tz::Tz;
 use gtfs_rt::trip_update::StopTimeUpdate;
@@ -34,6 +34,9 @@ pub struct DelayedTrip {
     pub trip_id: String,
     /// Human-readable route label (short name, long name, or id as a fallback).
     pub route: String,
+    /// What kind of vehicle runs this route (bus, tram, ferry…), from the static
+    /// schedule's `route_type`. `None` when the schedule isn't loaded or doesn't say.
+    pub route_kind: Option<RouteKind>,
     pub delay_seconds: i64,
     /// How the delay figure was derived — handy while validating a new feed.
     pub source: DelaySource,
@@ -258,7 +261,14 @@ fn describe(
 ) -> DelayedTrip {
     let static_trip = gtfs.and_then(|g| g.trip(trip_id));
 
-    let route = route_label(trip_update, static_trip.as_ref(), gtfs);
+    let route_id = route_id(trip_update, static_trip.as_ref());
+    let route = route_label(route_id.as_deref(), gtfs);
+    // Only the static schedule knows what runs a route, so a feed whose schedule
+    // isn't loaded yet simply has no mode — the page falls back to a generic vehicle.
+    let route_kind = match (route_id.as_deref(), gtfs) {
+        (Some(id), Some(g)) => g.route_kind(id),
+        _ => None,
+    };
     let headsign = describe_headsign(trip_update, static_trip.as_ref(), gtfs, trip_id);
     let next_stop =
         upcoming_stop(trip_update, now).and_then(|stop| next_stop_name(stop, gtfs, trip_id));
@@ -268,6 +278,7 @@ fn describe(
     DelayedTrip {
         trip_id: trip_id.to_string(),
         route,
+        route_kind,
         delay_seconds: measurement.delay_seconds,
         source: measurement.source,
         headsign,
@@ -415,27 +426,29 @@ fn stop_delay(stu: &StopTimeUpdate) -> Option<i32> {
         .or_else(|| stu.departure.as_ref().and_then(|e| e.delay))
 }
 
-/// Best human-readable label for a trip's route.
-///
-/// The realtime feed's `route_id` is preferred, falling back to the static
-/// trip's `route_id`; the resolved route's short name (then long name) is used,
-/// with the raw id as a last resort.
-fn route_label(
-    trip_update: &TripUpdate,
-    static_trip: Option<&Trip>,
-    gtfs: Option<&Gtfs>,
-) -> String {
-    let Some(route_id) = trip_update
+/// The route a trip runs on: the realtime feed's `route_id` preferred, falling back
+/// to the static trip's. `None` when neither names one.
+fn route_id(trip_update: &TripUpdate, static_trip: Option<&Trip>) -> Option<String> {
+    // Both sides can carry a present-but-blank id, which names no route — so each is
+    // filtered before the fallback rather than after, or a blank realtime id would
+    // shadow a perfectly good static one.
+    let named = |id: &String| !id.is_empty();
+    trip_update
         .trip
         .route_id
         .clone()
-        .or_else(|| static_trip.map(|t| t.route_id.clone()))
-    else {
+        .filter(named)
+        .or_else(|| static_trip.map(|t| t.route_id.clone()).filter(named))
+}
+
+/// Best human-readable label for a trip's route: the resolved route's short name
+/// (then long name), with the raw id as a last resort.
+fn route_label(route_id: Option<&str>, gtfs: Option<&Gtfs>) -> String {
+    let Some(route_id) = route_id else {
         return "Unknown route".to_string();
     };
-
-    gtfs.and_then(|g| g.route_name(&route_id))
-        .unwrap_or(route_id)
+    gtfs.and_then(|g| g.route_name(route_id))
+        .unwrap_or_else(|| route_id.to_string())
 }
 
 /// Where the bus is signed for: the static trip's headsign (or destination),

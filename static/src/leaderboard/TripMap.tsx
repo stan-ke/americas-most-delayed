@@ -3,15 +3,48 @@ import { Show, createEffect, createSignal, onCleanup, onMount } from "solid-js";
 import { AMD_API } from "../lib/api";
 import { endedAgo, fmtDelay, peak, tripKey } from "../lib/format";
 import { decodePolyline } from "../lib/polyline";
-import type { LeaderboardEntry, ShapeResponse } from "../lib/types";
+import type {
+	LeaderboardEntry,
+	ShapeResponse,
+	VehicleType,
+} from "../lib/types";
 
-const busIcon = L.divIcon({
-	html: "🚌",
-	className: "bus-icon",
-	iconSize: [28, 28],
-	iconAnchor: [14, 14],
-	popupAnchor: [0, -14],
-});
+/**
+ * The marker for each mode the server can classify a route as. A trip whose agency
+ * hasn't published a `route_type` — or whose static schedule isn't loaded yet —
+ * gets the bus, which is what the overwhelming majority of these trips are.
+ */
+const VEHICLE_EMOJI: Record<VehicleType, string> = {
+	tram: "🚊",
+	subway: "🚇",
+	rail: "🚆",
+	bus: "🚌",
+	ferry: "⛴️",
+	"cable-tram": "🚋",
+	"aerial-lift": "🚡",
+	funicular: "🚟",
+	trolleybus: "🚎",
+	monorail: "🚝",
+};
+const DEFAULT_EMOJI = VEHICLE_EMOJI.bus;
+
+/** Leaflet icons are immutable, so one per emoji is built once and shared. */
+const icons = new Map<string, L.DivIcon>();
+const vehicleIcon = (type: VehicleType | null | undefined) => {
+	const emoji = (type && VEHICLE_EMOJI[type]) || DEFAULT_EMOJI;
+	let icon = icons.get(emoji);
+	if (!icon) {
+		icon = L.divIcon({
+			html: emoji,
+			className: "vehicle-icon",
+			iconSize: [28, 28],
+			iconAnchor: [14, 14],
+			popupAnchor: [0, -14],
+		});
+		icons.set(emoji, icon);
+	}
+	return icon;
+};
 
 /**
  * The selected vehicle on a map, with its scheduled route drawn behind it.
@@ -114,7 +147,7 @@ export function TripMap(props: {
 			const points = decodePolyline(polyline || "");
 			// Guard against the rotation having moved on while we awaited.
 			if (shapeKey !== k || points.length < 2) return;
-			// The line goes in Leaflet's overlay pane and the bus marker in the marker
+			// The line goes in Leaflet's overlay pane and the vehicle marker in the marker
 			// pane above it, so the vehicle stays on top of its own route for free.
 			routeLine = L.polyline(points, {
 				color: "#d33",
@@ -157,8 +190,14 @@ export function TripMap(props: {
 		void drawRoute(e);
 
 		const ll: L.LatLngExpression = [e.latitude, e.longitude];
-		if (!marker) marker = L.marker(ll, { icon: busIcon }).addTo(map);
-		else marker.setLatLng(ll);
+		const icon = vehicleIcon(e.vehicle_type);
+		if (!marker) marker = L.marker(ll, { icon }).addTo(map);
+		else {
+			marker.setLatLng(ll);
+			// The rotation reuses the one marker, so the icon has to follow the trip
+			// — otherwise a ferry inherits the previous entry's bus.
+			if (marker.getIcon() !== icon) marker.setIcon(icon);
+		}
 		marker.bindPopup(popupFor(e));
 		// Only recenter on the vehicle when we haven't fitted the map to a route.
 		if (!routeLine) map.setView(ll, 12);

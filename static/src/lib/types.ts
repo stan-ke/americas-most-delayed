@@ -9,6 +9,23 @@
 /** How a delay was derived. */
 export type DelaySource = "trip-level" | "stop-level" | "vs-schedule";
 
+/**
+ * What kind of vehicle runs a trip's route, from the static schedule's
+ * `route_type` (see `../server/src/gtfs.rs`'s `RouteKind`). `null` when the
+ * agency's schedule isn't loaded or doesn't classify the route.
+ */
+export type VehicleType =
+	| "tram"
+	| "subway"
+	| "rail"
+	| "bus"
+	| "ferry"
+	| "cable-tram"
+	| "aerial-lift"
+	| "funicular"
+	| "trolleybus"
+	| "monorail";
+
 /** One line of the score breakdown: what the factor is, and why. */
 export interface ScoreStep {
 	name: string;
@@ -35,6 +52,8 @@ export interface LeaderboardEntry {
 	slug: string;
 	trip_id: string;
 	route: string;
+	/** Which vehicle the map draws for this trip; `null` when the mode is unknown. */
+	vehicle_type: VehicleType | null;
 	headsign: string | null;
 	next_stop: string | null;
 	vehicle: string | null;

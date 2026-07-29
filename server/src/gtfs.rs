@@ -87,12 +87,19 @@ fn set_heap_limit() {
 /// implicit `rowid` (used to find a trip's final stop in file order).
 const SCHEMA: &str = "\
 CREATE TABLE agency(timezone TEXT);
-CREATE TABLE routes(route_id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT);
+CREATE TABLE routes(route_id TEXT PRIMARY KEY, short_name TEXT, long_name TEXT, route_type INTEGER);
 CREATE TABLE stops(stop_id TEXT PRIMARY KEY, stop_name TEXT);
 CREATE TABLE trips(trip_id TEXT PRIMARY KEY, route_id TEXT, trip_headsign TEXT, direction_id INTEGER, shape_id TEXT);
 CREATE TABLE stop_times(trip_id TEXT, stop_sequence INTEGER, stop_id TEXT, time INTEGER);
 CREATE TABLE shapes(shape_id TEXT, seq INTEGER, lat REAL, lon REAL);
 ";
+
+/// Version stamped into each built index's `user_version` pragma, and checked before
+/// one is reused. Bump it whenever [`SCHEMA`] or the import changes: the index is a
+/// derivative of a zip that may not be re-downloaded for another 24h, so without this
+/// an added column would read as missing on every already-cached feed until its zip
+/// happened to age out. A version mismatch simply rebuilds, same as a stale zip.
+const SCHEMA_VERSION: i64 = 2;
 
 /// An indexed static GTFS feed, backed by an on-disk SQLite database.
 ///
@@ -116,6 +123,80 @@ pub struct Trip {
     pub route_id: String,
     pub trip_headsign: Option<String>,
     pub direction_id: Option<Direction>,
+}
+
+/// What kind of vehicle runs a route — GTFS `routes.txt` `route_type`, reduced to
+/// the modes worth telling apart on screen.
+///
+/// GTFS has two numbering schemes for this and feeds use both: the seven basic codes
+/// (plus 11/12) from the original spec, and the ~200 **extended** codes (100–1799)
+/// borrowed from the European TPEG taxonomy, where whole hundreds are one mode
+/// ("700–799 is bus service"). [`RouteKind::from_route_type`] folds both into this
+/// handful, since "bus" and "express bus" want the same icon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RouteKind {
+    Tram,
+    Subway,
+    Rail,
+    Bus,
+    Ferry,
+    CableTram,
+    AerialLift,
+    Funicular,
+    Trolleybus,
+    Monorail,
+}
+
+impl RouteKind {
+    /// Classify a GTFS `route_type`. `None` for a code we don't recognise (a
+    /// mode with no sensible icon, like air or taxi service, or simply a value the
+    /// spec doesn't define) — callers fall back to a generic vehicle rather than
+    /// guessing.
+    pub fn from_route_type(route_type: i64) -> Option<RouteKind> {
+        Some(match route_type {
+            // The basic codes.
+            0 => RouteKind::Tram,
+            1 => RouteKind::Subway,
+            2 => RouteKind::Rail,
+            3 => RouteKind::Bus,
+            4 => RouteKind::Ferry,
+            5 => RouteKind::CableTram,
+            6 => RouteKind::AerialLift,
+            7 => RouteKind::Funicular,
+            11 => RouteKind::Trolleybus,
+            12 => RouteKind::Monorail,
+            // The extended codes, by hundred. `405` (monorail) is the one code that
+            // doesn't go with its block, so it's matched ahead of it.
+            405 => RouteKind::Monorail,
+            100..=199 | 300..=399 => RouteKind::Rail,
+            200..=299 | 700..=799 => RouteKind::Bus,
+            400..=699 => RouteKind::Subway,
+            800..=899 => RouteKind::Trolleybus,
+            900..=999 => RouteKind::Tram,
+            1000..=1099 | 1200..=1299 => RouteKind::Ferry,
+            1300..=1399 => RouteKind::AerialLift,
+            1400..=1499 => RouteKind::Funicular,
+            _ => return None,
+        })
+    }
+
+    /// Stable wire tag for this mode — what the leaderboard page keys its vehicle
+    /// icon on. A name rather than the raw `route_type` number, so the frontend
+    /// doesn't have to re-implement the extended-code arithmetic above.
+    pub fn label(self) -> &'static str {
+        match self {
+            RouteKind::Tram => "tram",
+            RouteKind::Subway => "subway",
+            RouteKind::Rail => "rail",
+            RouteKind::Bus => "bus",
+            RouteKind::Ferry => "ferry",
+            RouteKind::CableTram => "cable-tram",
+            RouteKind::AerialLift => "aerial-lift",
+            RouteKind::Funicular => "funicular",
+            RouteKind::Trolleybus => "trolleybus",
+            RouteKind::Monorail => "monorail",
+        }
+    }
 }
 
 /// GTFS `direction_id`: 0 is outbound, 1 is inbound.
@@ -170,6 +251,20 @@ impl Gtfs {
             "SELECT coalesce(short_name, long_name) FROM routes WHERE route_id = ?1",
             [route_id],
         )
+    }
+
+    /// What kind of vehicle runs a route, from its `route_type`. `None` when the
+    /// route is unknown, publishes no type, or publishes one we don't classify — the
+    /// leaderboard then shows a generic vehicle rather than claiming a mode.
+    pub fn route_kind(&self, route_id: &str) -> Option<RouteKind> {
+        let conn = self.db.lock().ok()?;
+        conn.prepare_cached("SELECT route_type FROM routes WHERE route_id = ?1")
+            .ok()?
+            .query_row([route_id], |r| r.get::<_, Option<i64>>(0))
+            .optional()
+            .ok()?
+            .flatten()
+            .and_then(RouteKind::from_route_type)
     }
 
     /// Rider-facing name of a stop, if known.
@@ -516,15 +611,30 @@ fn open_or_build(zip_paths: Vec<PathBuf>, db_path: PathBuf, display_name: String
     })
 }
 
-/// Whether the SQLite index must be rebuilt: it's missing, or *any* cached zip it
-/// was derived from is newer (a maintenance refresh re-downloaded a fresh zip).
+/// Whether the SQLite index must be rebuilt: it's missing, it was built by an older
+/// [`SCHEMA_VERSION`], or *any* cached zip it was derived from is newer (a
+/// maintenance refresh re-downloaded a fresh zip).
 fn needs_rebuild(db_path: &Path, zip_paths: &[PathBuf]) -> bool {
     let Some(db) = mtime(db_path) else {
         return true;
     };
+    if schema_version(db_path) != Some(SCHEMA_VERSION) {
+        return true;
+    }
     zip_paths
         .iter()
         .any(|zip| mtime(zip).is_none_or(|zip| db < zip))
+}
+
+/// The `user_version` an existing index was stamped with, or `None` if it can't be
+/// read (a corrupt or half-written file — which rebuilds, exactly as it should).
+fn schema_version(db_path: &Path) -> Option<i64> {
+    let conn = Connection::open_with_flags(
+        db_path,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .ok()?;
+    conn.query_row("PRAGMA user_version", [], |r| r.get(0)).ok()
 }
 
 /// A file's modification time, or `None` if it can't be read.
@@ -579,6 +689,8 @@ fn build_sqlite(zip_paths: &[PathBuf], db_path: &Path, display_name: &str) -> Re
         "CREATE INDEX idx_stop_times_trip ON stop_times(trip_id);
          CREATE INDEX idx_shapes_shape ON shapes(shape_id);",
     )?;
+    // Stamped last, so an index that failed part-way through never reads as current.
+    conn.pragma_update(None, "user_version", SCHEMA_VERSION)?;
     drop(conn);
 
     std::fs::rename(&tmp, db_path).with_context(|| format!("finalizing {}", db_path.display()))?;
@@ -669,13 +781,16 @@ fn import_members(conn: &Connection, archive: &mut Zip) -> Result<()> {
         conn,
         archive,
         "routes.txt",
-        "INSERT OR REPLACE INTO routes(route_id, short_name, long_name) VALUES(?1,?2,?3)",
+        "INSERT OR REPLACE INTO routes(route_id, short_name, long_name, route_type) \
+         VALUES(?1,?2,?3,?4)",
         |row, stmt| match row.get_non_empty("route_id") {
             Some(id) => stmt
                 .execute(params![
                     id,
                     row.get_non_empty("route_short_name"),
                     row.get_non_empty("route_long_name"),
+                    row.get("route_type")
+                        .and_then(|t| t.trim().parse::<i64>().ok()),
                 ])
                 .map(|_| ()),
             None => Ok(()),
