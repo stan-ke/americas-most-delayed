@@ -1,7 +1,10 @@
 {
     "$schema": "https://docs.renovatebot.com/renovate-schema.json",
     "extends": [
-        "config:best-practices"
+        "config:best-practices",
+        ":dependencyDashboard",
+        "group:allNonMajor",
+        "schedule:weekly"
     ],
     "git-submodules": {
         "enabled": true
