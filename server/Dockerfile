@@ -1,4 +1,4 @@
-FROM rust:latest AS builder
+FROM rust:latest@sha256:3382bd20aa942806c533e9a73cd000474fb3ef173f71e684cc9b942675781769 AS builder
 
 WORKDIR /app
 COPY src/ ./src/
@@ -18,7 +18,7 @@ RUN ldd target/x86_64-unknown-linux-musl/release/server || true
 # CMD ["/app/server"]
 
 # Go alpine instead for healthcheck
-FROM alpine:latest AS runtime
+FROM alpine:latest@sha256:28bd5fe8b56d1bd048e5babf5b10710ebe0bae67db86916198a6eec434943f8b AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server /app/server
 EXPOSE 8080
