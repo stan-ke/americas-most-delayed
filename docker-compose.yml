@@ -75,7 +75,7 @@ services:
     restart: unless-stopped
 
   prometheus:
-    image: prom/prometheus:latest
+    image: prom/prometheus:latest@sha256:508729e0e2d18e11fd742a5a5ca70e557b940a93948c3c95fd0123a6fd538b69
     ports:
       - "9090:9090"
     volumes:
@@ -86,7 +86,7 @@ services:
     restart: unless-stopped
 
   grafana:
-    image: grafana/grafana:latest
+    image: grafana/grafana:latest@sha256:ab5cb380e3ff3172d6c8bd2e7cfd31cce977d2881b260e1f5bc089bf0b759b43
     ports:
       - "3001:3000"
     environment:
