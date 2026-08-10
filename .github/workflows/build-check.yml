@@ -28,8 +28,6 @@ jobs:
         run: pnpm install --frozen-lockfile
       - name: Build static app
         run: pnpm build
-        env:
-          VITE_AMD_API: https://amd-api.stan.ke
 
   build-server:
     name: Build server image
