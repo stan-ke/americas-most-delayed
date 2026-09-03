@@ -18,6 +18,6 @@ ARG VITE_AMD_API=""
 ENV VITE_AMD_API=$VITE_AMD_API
 RUN npm run build
 
-FROM nginx:alpine@sha256:db35bfc6b2951e7f8a72db5db120288c127ffaeeb4a6d4b95a26fead017d5913 AS runtime
+FROM nginx:alpine@sha256:a9ae6f6d078d477e21323310498e5196cb2b7c0aedd9e07b7306612077227d7c AS runtime
 COPY --from=builder /app/dist /usr/share/nginx/html
 EXPOSE 80
