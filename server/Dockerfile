@@ -18,7 +18,7 @@ RUN ldd target/x86_64-unknown-linux-musl/release/server || true
 # CMD ["/app/server"]
 
 # Go alpine instead for healthcheck
-FROM alpine:latest@sha256:294b683cb724975bec92580e1e685676bd4b50bda910ddb8c51d4cabeaec77e6 AS runtime
+FROM alpine:latest@sha256:71e9b7bae160ba167fa17414401b94cbcdaf3c32feeab9298bd794a2a0614c35 AS runtime
 WORKDIR /app
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/server /app/server
 EXPOSE 8080
