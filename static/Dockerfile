@@ -5,7 +5,7 @@
 # is free, and the whole point of the split is to keep bytes off the billed host.
 # See README.md.
 
-FROM node:24-alpine@sha256:6a1c190e17215d844926b0677f4bf87273ff7d5e54db06d3b5b5863ab0b09a3d AS builder
+FROM node:24-alpine@sha256:06d7adf3e0ef61a13f1d28682726366f97a15aa1888c934d3ecec86c33918b53 AS builder
 WORKDIR /app
 # Dependencies first, so a source-only change doesn't reinstall them.
 COPY package.json package-lock.json ./
