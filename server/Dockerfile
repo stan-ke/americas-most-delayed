@@ -1,4 +1,4 @@
-FROM rust:latest@sha256:223cc32ddca8f3ee90c436dbc94b6b5f052ea7f9653c5201e9612f08ad7d21b8 AS builder
+FROM rust:latest@sha256:1f65e0abcce9b449f9533df5994f2a62391059196c481a09b8e1b522dd6d75af AS builder
 
 WORKDIR /app
 COPY src/ ./src/
